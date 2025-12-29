@@ -53,7 +53,7 @@ Compares three attention implementations during the **prefilling phase** (proces
 3. **Flash Attention (O(N) memory)**: Memory-efficient online softmax algorithm that processes attention in blocks
 
 ```bash
-benchmark_decoding.py
+uv run python benchmark_decoding.py
 ```
 
 This is the decoding phase comparison
