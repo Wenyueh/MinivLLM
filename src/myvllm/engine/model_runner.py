@@ -40,11 +40,24 @@ class ModelRunner:
             ffn_bias=config['ffn_bias'],
             num_layers=config['num_layers'],
             tie_word_embeddings=config['tie_word_embeddings'],
-        ).cuda(rank)
+            block_size=self.block_size,
+        )
+
+        # IMPORTANT: Move to CUDA before loading weights to avoid incorrect behavior
+        self.model = self.model.cuda(rank)
+
+        # Load pretrained weights if model_name_or_path is provided
+        if config.get('model_name_or_path'):
+            from myvllm.utils.loader import load_weights_from_checkpoint
+            load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+
         self.sampler = SamplerLayer()
 
         # Store default dtype before it's needed in allocate_kv_cache
         self.default_dtype = torch.get_default_dtype()
+
+        # Debug flag for first decode step
+        self._first_decode = False
 
         # warm up model so that we know peak memory usage
         self.warmup_model()
@@ -175,7 +188,8 @@ class ModelRunner:
 
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
-        allocated_kv_cache = torch.empty(2, self.config['num_layers'], self.num_available_kv_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
+        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.num_available_kv_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
@@ -230,13 +244,15 @@ class ModelRunner:
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+
         set_context(
             is_prefill=True,
             cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_seqlen_q=max(seqlens_q),
             max_seqlen_k=max(seqlens_k),
-            slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=slot_mapping_tensor,
             context_lens=None,
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
         )
@@ -284,7 +300,8 @@ class ModelRunner:
         if is_prefill or self.enforce_eager:
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
-            logits = self.model.compute_logits(self.model(input_ids))
+            hidden_states = self.model(input_ids)
+            logits = self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
             context = get_context()
