@@ -305,41 +305,41 @@ def paged_attention_decode_kernel(
     """
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
-
+    
     # Determine which KV head this query head uses (for GQA)
     kv_head_idx = head_idx // (num_heads // num_kv_heads)
-
+    
     # Load context length
     context_len = tl.load(context_lens_ptr + batch_idx)
-
+    
     # Load query: (batch_size, num_heads, head_dim)
     offs_d = tl.arange(0, head_dim)
     q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
     q = tl.load(query_ptr + q_offset)
-
+    
     # Initialize accumulators
     acc = tl.zeros([head_dim], dtype=tl.float32)
     l_i = 0.0
     m_i = -1e10
-
+    
     # Calculate total number of chunks to process
     max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
-
+    
     # Process all tokens in chunks
     for chunk_idx in range(max_chunks):
         # Global token index for this chunk
         token_start = chunk_idx * BLOCK_N
-
+        
         # Only process if within valid range
         if token_start < context_len:
             # Determine which tokens in this chunk are valid
             offs_n = token_start + tl.arange(0, BLOCK_N)
             mask_n = offs_n < context_len
-
-
+            
+          
             # Compute attention scores for this chunk
             qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
-
+            
             # Load K for each valid position and compute scores
             for i in range(BLOCK_N):
                 token_idx = token_start + i
@@ -368,20 +368,20 @@ def paged_attention_decode_kernel(
                                 # Update qk array at position i using tl.where
                                 mask_i = tl.arange(0, BLOCK_N) == i
                                 qk = tl.where(mask_i, score, qk)
-
+            
             # Apply mask to invalid positions
             qk = tl.where(mask_n, qk, -1e10)
-
+            
             # Online softmax
             m_ij = tl.max(qk)
             m_i_new = tl.maximum(m_i, m_ij)
             alpha = tl.exp(m_i - m_i_new)
             p = tl.exp(qk - m_i_new)
-
+            
             # Rescale accumulator
             acc = acc * alpha
             l_i = l_i * alpha
-
+            
             # Load V and accumulate
             for i in range(BLOCK_N):
                 token_idx = token_start + i
@@ -410,12 +410,12 @@ def paged_attention_decode_kernel(
 
                                 acc = acc + weight * v_vec
                                 l_i = l_i + weight
-
+            
             m_i = m_i_new
-
+    
     # Normalize
     output = acc / l_i
-
+    
     # Store output
     output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
     tl.store(output_ptr + output_offset, output)

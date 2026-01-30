@@ -90,7 +90,7 @@ class Sequence:
 
     def mark_dead(self, start: int, end: int):
         """Mark tokens [start, end) as dead (don't attend to them)."""
-        self.dead_ranges.append((start, end)) 
+        self.dead_ranges.append((start, end))
 
     def __getstate__(self):
         return (
