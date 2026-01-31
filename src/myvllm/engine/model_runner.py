@@ -262,8 +262,8 @@ class ModelRunner:
     # prepare input data for decoding
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
         input_ids = []
-        context_lens = []   
-        slot_mappings = []  
+        context_lens = []
+        slot_mappings = []
         block_tables = []
         for seq in seqs:
             input_ids.append(seq.last_token)
@@ -274,6 +274,18 @@ class ModelRunner:
         for i, seq in enumerate(seqs):
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
+
+        # Build dead_mask for sparse attention
+        max_context_len = max(context_lens)
+        dead_mask = torch.zeros(len(seqs), max_context_len, dtype=torch.int32, device='cpu', pin_memory=True)
+        for batch_idx, seq in enumerate(seqs):
+            for dead_start, dead_end in seq.dead_ranges:
+                # Clamp to valid range
+                start = max(0, dead_start)
+                end = min(max_context_len, dead_end)
+                if start < end:
+                    dead_mask[batch_idx, start:end] = 1
+
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         set_context(
             is_prefill=False,
@@ -284,6 +296,7 @@ class ModelRunner:
             slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            dead_mask=dead_mask.cuda(non_blocking=True),
         )
         return input_ids    
 
@@ -316,6 +329,10 @@ class ModelRunner:
             vars["context_lens"].zero_()
             vars['context_lens'][:bs].copy_(context.context_lens)
             vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # copy dead_mask for sparse attention
+            vars["dead_mask"].zero_()
+            if context.dead_mask is not None:
+                vars["dead_mask"][:bs, :context.dead_mask.size(1)] = context.dead_mask
             # replay the graph
             graph.replay()
             logits = self.model.compute_logits(vars['outputs'][:bs])
@@ -361,6 +378,8 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # where to read KV values in the cache
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
+        # dead_mask for sparse attention (1 = dead token, 0 = alive)
+        dead_mask = torch.zeros(max_bs, max_len, dtype=torch.int32, device=f'cuda:{self.rank}')
         # output logits
         outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
 
@@ -380,6 +399,7 @@ class ModelRunner:
                 slot_mapping=slot_mapping[:batch_size],
                 context_lens=context_lens[:batch_size],
                 block_tables=block_tables[:batch_size],
+                dead_mask=dead_mask[:batch_size],
             )
             outputs[:batch_size] = self.model(input_ids[:batch_size])
 
@@ -399,5 +419,6 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            dead_mask=dead_mask,
             outputs=outputs,
         )

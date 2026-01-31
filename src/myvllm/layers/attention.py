@@ -288,17 +288,20 @@ def paged_attention_decode_kernel(
     v_cache_ptr,
     block_tables_ptr,
     context_lens_ptr,
+    dead_mask_ptr,  # NEW: pointer to dead token mask (batch_size, max_context_len)
     scale: tl.constexpr,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     max_num_blocks: tl.constexpr,
+    max_context_len: tl.constexpr,  # NEW: for dead_mask indexing
     BLOCK_N: tl.constexpr,
 ):
     """
     Optimized paged attention kernel for decode phase.
     Processes KV cache in chunks.
+    Supports sparse attention via dead_mask (skips tokens marked as dead).
     """
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -341,27 +344,30 @@ def paged_attention_decode_kernel(
             for i in range(BLOCK_N):
                 token_idx = token_start + i
                 if token_idx < context_len:
-                    block_num = token_idx // block_size
-                    block_offset = token_idx % block_size
-                    
-                    if block_num < max_num_blocks:
-                        # Look up physical block
-                        block_table_offset = batch_idx * max_num_blocks + block_num
-                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
-                        
-                        if physical_block_idx != -1:
-                            # Load K
-                            k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                       block_offset * num_kv_heads * head_dim +
-                                       kv_head_idx * head_dim + offs_d)
-                            k_vec = tl.load(k_cache_ptr + k_offset)
-                            
-                            # Compute score for this token
-                            score = tl.sum(q * k_vec) * scale
-                            
-                            # Update qk array at position i using tl.where
-                            mask_i = tl.arange(0, BLOCK_N) == i
-                            qk = tl.where(mask_i, score, qk)
+                    # Check if token is dead (sparse attention)
+                    is_dead = tl.load(dead_mask_ptr + batch_idx * max_context_len + token_idx)
+                    if is_dead == 0:  # Only process alive tokens
+                        block_num = token_idx // block_size
+                        block_offset = token_idx % block_size
+
+                        if block_num < max_num_blocks:
+                            # Look up physical block
+                            block_table_offset = batch_idx * max_num_blocks + block_num
+                            physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+
+                            if physical_block_idx != -1:
+                                # Load K
+                                k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
+                                           block_offset * num_kv_heads * head_dim +
+                                           kv_head_idx * head_dim + offs_d)
+                                k_vec = tl.load(k_cache_ptr + k_offset)
+
+                                # Compute score for this token
+                                score = tl.sum(q * k_vec) * scale
+
+                                # Update qk array at position i using tl.where
+                                mask_i = tl.arange(0, BLOCK_N) == i
+                                qk = tl.where(mask_i, score, qk)
             
             # Apply mask to invalid positions
             qk = tl.where(mask_n, qk, -1e10)
@@ -380,27 +386,30 @@ def paged_attention_decode_kernel(
             for i in range(BLOCK_N):
                 token_idx = token_start + i
                 if token_idx < context_len:
-                    block_num = token_idx // block_size
-                    block_offset = token_idx % block_size
-                    
-                    if block_num < max_num_blocks:
-                        # Look up physical block
-                        block_table_offset = batch_idx * max_num_blocks + block_num
-                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
-                        
-                        if physical_block_idx != -1:
-                            # Load V
-                            v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                       block_offset * num_kv_heads * head_dim +
-                                       kv_head_idx * head_dim + offs_d)
-                            v_vec = tl.load(v_cache_ptr + v_offset)
-                            
-                            # Extract weight for this token from p
-                            mask_i = tl.arange(0, BLOCK_N) == i
-                            weight = tl.sum(tl.where(mask_i, p, 0.0))
-                            
-                            acc = acc + weight * v_vec
-                            l_i = l_i + weight
+                    # Check if token is dead (sparse attention)
+                    is_dead = tl.load(dead_mask_ptr + batch_idx * max_context_len + token_idx)
+                    if is_dead == 0:  # Only process alive tokens
+                        block_num = token_idx // block_size
+                        block_offset = token_idx % block_size
+
+                        if block_num < max_num_blocks:
+                            # Look up physical block
+                            block_table_offset = batch_idx * max_num_blocks + block_num
+                            physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+
+                            if physical_block_idx != -1:
+                                # Load V
+                                v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
+                                           block_offset * num_kv_heads * head_dim +
+                                           kv_head_idx * head_dim + offs_d)
+                                v_vec = tl.load(v_cache_ptr + v_offset)
+
+                                # Extract weight for this token from p
+                                mask_i = tl.arange(0, BLOCK_N) == i
+                                weight = tl.sum(tl.where(mask_i, p, 0.0))
+
+                                acc = acc + weight * v_vec
+                                l_i = l_i + weight
             
             m_i = m_i_new
     
@@ -418,6 +427,7 @@ def paged_attention_decode(
     v_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
+    dead_mask: torch.Tensor,
     scale: float,
     num_heads: int,
     num_kv_heads: int,
@@ -426,31 +436,33 @@ def paged_attention_decode(
 ) -> torch.Tensor:
     """
     Compute attention in decode mode using paged KV cache.
-    
+
     Args:
         query: (batch_size, num_heads, head_dim)
         k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         block_tables: (batch_size, max_num_blocks)
         context_lens: (batch_size,)
+        dead_mask: (batch_size, max_context_len) - 1 for dead tokens, 0 for alive
         scale: attention scale factor
-    
+
     Returns:
         output: (batch_size, num_heads, head_dim)
     """
     batch_size = query.shape[0]
     max_num_blocks = block_tables.shape[1]
-    
+    max_context_len = dead_mask.shape[1]
+
     # Make contiguous
     query = query.contiguous()
-    
+
     output = torch.empty_like(query)
-    
+
     # Chunk size for processing KV tokens
     BLOCK_N = 64 if head_dim <= 128 else 32
-    
+
     grid = (batch_size, num_heads)
-    
+
     paged_attention_decode_kernel[grid](
         output,
         query,
@@ -458,15 +470,17 @@ def paged_attention_decode(
         v_cache,
         block_tables,
         context_lens,
+        dead_mask,
         scale=scale,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         block_size=block_size,
         max_num_blocks=max_num_blocks,
+        max_context_len=max_context_len,
         BLOCK_N=BLOCK_N,
     )
-    
+
     return output
 
 
@@ -521,11 +535,12 @@ class Attention(nn.Module):
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:
             o = paged_attention_decode(
-                q, 
-                k_cache, 
+                q,
+                k_cache,
                 v_cache,
                 context.block_tables,
                 context.context_lens,
+                context.dead_mask,
                 scale,
                 self.num_heads,
                 self.num_kv_heads,

@@ -31,6 +31,8 @@ class Sequence:
         self.num_cached_tokens = 0
         # block_table
         self.block_table = []
+        # dead_ranges: list of (start, end) token positions to skip in attention
+        self.dead_ranges = []
         # sampling_params' related things
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -84,7 +86,11 @@ class Sequence:
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.last_token = token_id
-        self.num_tokens += 1 
+        self.num_tokens += 1
+
+    def mark_dead(self, start: int, end: int):
+        """Mark tokens [start, end) as dead (don't attend to them)."""
+        self.dead_ranges.append((start, end))
 
     def __getstate__(self):
         return (

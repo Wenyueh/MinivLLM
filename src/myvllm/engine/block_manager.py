@@ -84,6 +84,7 @@ class BlockManager:
                 # update block information, considering the edge case that the block is not allocated yet but with hash code
                 if block_id not in self.used_block_ids:
                     block = self._allocate_block(block_id)
+                    block.ref_count = 1
                 else:
                     # update block information
                     block = self.blocks[self.hash_to_block_id[h]]
@@ -91,6 +92,7 @@ class BlockManager:
             else:
                 # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
+                block.ref_count = 1
                 block.update(h=h, token_ids=token_ids)
                 if h != -1:
                     self.hash_to_block_id[h] = block.block_id
@@ -132,8 +134,75 @@ class BlockManager:
             # Previous block should be finalized
             assert self.blocks[last_block_for_seq_id].hash != -1
             block = self._allocate_block(self.free_block_ids[0])
+            block.ref_count = 1
             block_tables.append(block.block_id)
         # else, do nothing
         else:
             assert last_block_for_seq_id in self.used_block_ids, "Last block should be allocated"
             assert self.blocks[last_block_for_seq_id].hash == -1, "Last block should be partial block with hash -1"
+
+    def _is_range_fully_dead(self, start: int, end: int, dead_ranges: list) -> bool:
+        """Check if [start, end) is fully covered by the union of dead ranges."""
+        if not dead_ranges:
+            return False
+
+        # Collect ranges that overlap with [start, end)
+        overlapping = []
+        for dead_start, dead_end in dead_ranges:
+            # Check if there's any overlap
+            if dead_end > start and dead_start < end:
+                # Clip to [start, end)
+                overlap_start = max(start, dead_start)
+                overlap_end = min(end, dead_end)
+                overlapping.append((overlap_start, overlap_end))
+
+        if not overlapping:
+            return False
+
+        # Sort by start position
+        overlapping.sort()
+
+        # Merge overlapping/adjacent intervals
+        merged = [overlapping[0]]
+        for current_start, current_end in overlapping[1:]:
+            last_start, last_end = merged[-1]
+            if current_start <= last_end:  # Overlapping or adjacent
+                # Merge by extending the end
+                merged[-1] = (last_start, max(last_end, current_end))
+            else:
+                # Gap detected - not fully covered
+                return False
+
+        # Check if the merged interval fully covers [start, end)
+        return merged[0][0] <= start and merged[0][1] >= end
+
+    def evict_dead_blocks(self, seq: Sequence) -> int:
+        """
+        Free blocks where ALL tokens are dead.
+        Marks freed blocks as -1 in block_table (does not compact).
+        Returns number of blocks freed.
+        """
+        blocks_freed = 0
+
+        for block_idx, physical_block_id in enumerate(seq.block_table):
+            if physical_block_id == -1:
+                continue  # Already freed
+
+            block_start = block_idx * self.block_size
+            block_end = block_start + self.block_size
+
+            if self._is_range_fully_dead(block_start, block_end, seq.dead_ranges):
+                # Free this block
+                block = self.blocks[physical_block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    # Remove from prefix cache if present
+                    if block.hash != -1 and block.hash in self.hash_to_block_id:
+                        del self.hash_to_block_id[block.hash]
+                    self._deallocate_block(physical_block_id)
+
+                # Mark as freed in block_table (don't remove, keep index intact)
+                seq.block_table[block_idx] = -1
+                blocks_freed += 1
+
+        return blocks_freed
