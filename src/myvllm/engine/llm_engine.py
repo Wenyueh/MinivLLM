@@ -63,6 +63,9 @@ class LLMEngine:
             return [], is_prefill
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        # Move outputs to CPU and convert them to a list
+        if outputs is not None:
+            outputs = outputs.cpu().tolist()
         # postprocess the outputs
         self.scheduler.postprocess(scheduled_sequences, outputs)
 
