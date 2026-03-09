@@ -63,6 +63,12 @@ class LLMEngine:
             return [], is_prefill
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        # === 新增修复代码 开始 ===
+        # 模型输出是 GPU Tensor，scheduler 和 block_manager 需要 CPU 数据
+        # 将 outputs 移动到 CPU 并转换为 list
+        if outputs is not None:
+            outputs = outputs.cpu().tolist()
+        # === 新增修复代码 结束 ===
         # postprocess the outputs
         self.scheduler.postprocess(scheduled_sequences, outputs)
 
