@@ -342,22 +342,24 @@ class ModelRunner:
             hidden_states = self.model(input_ids)
             logits = self.model.compute_logits(hidden_states)
         else:
-            bs = input_ids.size(0)
-            context = get_context()
+            # NOTE: Does not support CUDA graphs
+            ...
+            # bs = input_ids.size(0)
+            # context = get_context()
 
-            # finds smallest captured graph that fits the batch size
-            graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
-            vars = self.graph_vars
-            # copy input data into graph variables
-            vars['input_ids'][:bs].copy_(input_ids)
-            vars['slot_mapping'][:bs].fill_(-1)
-            vars['slot_mapping'][:bs].copy_(context.slot_mapping)
-            vars["context_lens"].zero_()
-            vars['context_lens'][:bs].copy_(context.context_lens)
-            vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            # replay the graph
-            graph.replay()
-            logits = self.model.compute_logits(vars['outputs'][:bs])
+            # # finds smallest captured graph that fits the batch size
+            # graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
+            # vars = self.graph_vars
+            # # copy input data into graph variables
+            # vars['input_ids'][:bs].copy_(input_ids)
+            # vars['slot_mapping'][:bs].fill_(-1)
+            # vars['slot_mapping'][:bs].copy_(context.slot_mapping)
+            # vars["context_lens"].zero_()
+            # vars['context_lens'][:bs].copy_(context.context_lens)
+            # vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # # replay the graph
+            # graph.replay()
+            # logits = self.model.compute_logits(vars['outputs'][:bs])
 
         return logits
 

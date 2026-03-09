@@ -317,15 +317,16 @@ self.token_ids = copy(token_ids)  # MUST copy! Creates new list
 
 **序列状态跟踪：**
 - Waiting
-- Running  
+- Running 
+- Preempted
 - Finished
 
 **重要属性：**
 - `token_ids`：所有 token（prompt + 生成）
 - `num_tokens`：当前长度
+- `num_computed_tokens`: 已经计算的长度
 - `block_table`：该序列的 KV cache 存储在哪些内存块中
 - `status`：该序列在系统中的当前状态
-
 
 ---
 
@@ -334,7 +335,7 @@ self.token_ids = copy(token_ids)  # MUST copy! Creates new list
 具体实现：[block_manager.py](src/myvllm/engine/block_manager.py)
 
 
-**目的：** 表示一个固定大小的内存块，用于存储 KV cache。
+**目的：** 表示一个固定大小的内存块, 用于存储 KV cache。
 
 **关键概念：**
 
@@ -359,8 +360,8 @@ self.token_ids = copy(token_ids)  # MUST copy! Creates new list
 
 **缓存未命中检测：**
 ```python
+# cache miss
 if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-    cache_miss = True
 ```
 
 **为什么要同时检查这两个条件？**
@@ -428,11 +429,10 @@ def write_shm(self): pass         # 写入共享内存（master 进程）
 def warmup_model(self): pass      # 测量峰值显存占用
 def allocate_kv_cache(self): pass # 分配 KV cache 显存
 
-def prepare_prefill(self): pass   # 为 prefill 前向推理准备数据
-def prepare_decode(self): pass    # 为 decode 前向推理准备数据  
+def _prepare_inputs(self): pass   # 为前向推理准备数据 
 def prepare_sample(self): pass    # 为采样准备温度（temperature）
 
-def run_model(self): pass         # 执行模型（decode 阶段使用 CUDA graph）
+def run_model(self): pass         # 执行模型（CUDA graph 暂未支持）
 def run(self): pass               # 主入口：prepare → run → sample
 
 def capture_cudagraph(self): pass # 捕获 CUDA graphs 用于优化
@@ -493,17 +493,17 @@ for event in self.events:  # Note: plural, list of events
 
 ### 4.5 数据准备
 
-**`prepare_prefill(seqs)`：**
+**`_prepare_inputs(self)`：**
 
-**目的：** 为 prefill 前向计算准备数据，并支持前缀缓存（prefix caching）。
+**目的：** 为前向计算准备数据，并支持chunked_prefill。
 
 **输出：**
 - `input_ids`：所有序列的全部 tokens 合并成一个 list
-- `positions`：每个 token 的 position 索引
-- `cu_seqlens_q/k`：累计序列长度（用于标记边界）
-- `slot_mapping`：新 KV 应写入的位置
+- `slot_mappings`：新 KV 应写入的位置
+- `cu_seqlens`：累计序列长度（用于标记边界）
+- `context_lens`: 序列总长度(全局长度)
 - `block_tables`：KV 应从哪里读取
-
+- `discard_seq_ids`：不需要采样的序列(此时该序列处于chunked_prefill中间阶段)
 
 **为什么把 input_ids 展平成一个 list？**
 - FlashAttention 的要求：单次 kernel launch
@@ -515,9 +515,6 @@ for event in self.events:  # Note: plural, list of events
   │ └─────── end of seq1 (position 3)
   └────────── start (position 0)
   ```
-
-**为什么没有 `cu_seqlens_v`？**
-- 与 K 相同（key 和 value 的序列结构一致）
 
 **为什么要准备长度匹配的 block_tables？**
 - Attention kernel 需要读取 KV cache：
@@ -546,30 +543,6 @@ for event in self.events:  # Note: plural, list of events
 
 ---
 
-**`prepare_decode(seqs)`:**
-
-**目的:** 为解码阶段准备数据（每个序列一个 token）。
-
-**新的 slot 映射:**
-```python
-new_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-```
-
-**为什么不用担心 slot 重叠？**
-- BlockManager 的 `append()` 保证不会重叠:
-  ```python
-  # Seq has 256 tokens (block full)
-  seq.num_tokens = 256
-  256 % 256 = 0  → Block full, finalize it
-  
-  # Next token appended → num_tokens = 257
-  257 % 256 = 1  → Need new block!
-  block = self._allocate_block(self.free_block_ids[0])
-  seq.block_table.append(block.block_id)
-  ```
-
----
-
 **`prepare_sample(seqs)`:**
 
 **目的:** 准备温度（temperature）数值（并通过 padding 对齐 batch size）。
@@ -580,25 +553,15 @@ new_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
 
 **`run_model()`:**
 
-**用于 Prefill：** 直接计算前向传播。
+**Enforce Eager：** 直接计算前向传播。
 
-**用于 Decode：** 使用 CUDA Graph 来提升速度！
-
-```python
-graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-```
-**为什么要找到能容纳的最小图？**
-- 并不是每个 batch size 都一定有已捕获的图
-- 通过 padding 复用更大的图
-
-**为什么要用哨兵值填充 `slot_mapping` 和 `context_lens`？**
-- 使用的图比实际需求更大 → 用虚拟值填充未使用的槽位
+**CUDA graph: ** 目前由于使用了chunked_prefill还未支持, 需要考虑动态判断当前所有调度seqs是否全部属于decode阶段, 若属于则使用CUDA graph 否则走Eager
 ---
 
 **`run()`:**
 
 **主入口：**
-1. 组合 `prepare_prefill` + `run_model` + `sample`
+1. 组合 `_prepare_inputs` + `run_model` + `sample`
 2. 调用 `reset_context()` 清除缓存数据
 
 **为什么只有 rank 0 进行采样？**
@@ -670,8 +633,6 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 - 捕获执行图
 
 **组合使用：** `torch.compile` 减少 kernel 数量，CUDA graph 消除启动开销。
-
-
 
 ---
 
