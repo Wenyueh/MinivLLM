@@ -206,20 +206,16 @@ class Qwen3DecoderLayer(nn.Module):
         # Compute positions based on context (respecting sequence boundaries for batched prefill)
         from myvllm.utils import get_context
         context = get_context()
-        if context.is_prefill and context.cu_seqlens_q is not None:
-            # For batched prefill, create positions that restart at 0 for each sequence
-            positions = []
-            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
-            for i in range(len(cu_seqlens) - 1):
-                seq_len = cu_seqlens[i+1] - cu_seqlens[i]
-                positions.extend(range(seq_len))
-            positions = torch.tensor(positions, dtype=torch.long, device=x.device)
-        elif context.is_prefill:
-            # For single sequence prefill, use sequential positions
-            positions = torch.arange(x.size(0), device=x.device)
-        else:
-            # For decode, use context_lens - 1 as positions (current position for each sequence)
-            positions = context.context_lens - 1
+        context_lens = context.context_lens
+        cu_seqlens = context.cu_seqlens_q
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        computed_seq_lens = context_lens - seq_lens 
+        positions = []
+        for i in range(len(seq_lens)):
+            seq_len = seq_lens[i].item()
+            computed_seq_len = computed_seq_lens[i].item()
+            positions.extend([computed_seq_len + j for j in range(seq_len)])
+        positions = torch.tensor(positions, dtype=torch.long, device=x.device)
 
         x = self.self_attn(x, positions=positions)
         # Residual connection always on for attention output

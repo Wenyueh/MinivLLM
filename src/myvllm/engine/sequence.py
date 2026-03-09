@@ -1,36 +1,44 @@
-from enum import Enum, auto
 import math
-from itertools import count 
-from myvllm.sampling_parameters import SamplingParams
 from copy import copy
+from enum import Enum, auto
+from itertools import count 
+
+from myvllm.sampling_parameters import SamplingParams
+
 
 
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
+    PREEMPTED = auto()
     FINISHED = auto()
 
 
 class Sequence:
-    block_size = 256 # number of tokens per block
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], block_size: int, sampling_params = SamplingParams()):
         # record sequence id
         self.seq_id = next(Sequence.counter)
         # status
         self.status = SequenceStatus.WAITING
+        # block_size
+        self.block_size = block_size
+
         # token ids, need copy so that it is a new list, won't be affected by outside changes
-        self.token_ids = copy(token_ids)
+        self.token_ids:list[int] = copy(token_ids)
         # last token
         self.last_token = self.token_ids[-1] if self.token_ids else None
-        # num_tokens, num_prompt_tokens
-        self.num_tokens = len(self.token_ids)
+        # prompt token
         self.num_prompt_tokens = len(self.token_ids)
         # num_cached_tokens = 0
         self.num_cached_tokens = 0
+        self.num_computed_tokens = 0
+        self.num_preeptions = 0
+
         # block_table
         self.block_table = []
+
         # sampling_params' related things
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -38,7 +46,7 @@ class Sequence:
         self.max_model_length = sampling_params.max_model_length
 
     def __len__(self):
-        return self.num_tokens
+        return len(self.token_ids)
 
     def __getitem__(self, idx):
         return self.token_ids[idx]
@@ -46,6 +54,10 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.token_ids)
 
     @property
     def num_completion_tokens(self):
@@ -58,10 +70,6 @@ class Sequence:
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens:]
-
-    @property
-    def num_cached_blocks(self):
-        return int(math.ceil(self.num_cached_tokens / self.block_size))
 
     @property
     def num_blocks(self):
@@ -84,13 +92,14 @@ class Sequence:
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.last_token = token_id
-        self.num_tokens += 1 
 
     def __getstate__(self):
         return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
-            self.num_cached_tokens, 
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_computed_tokens,
+            self.num_cached_tokens,
+            self.num_preeptions,
             self.block_table,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token
         )
@@ -99,7 +108,9 @@ class Sequence:
         (
             self.num_tokens,
             self.num_prompt_tokens,
+            self.num_computed_tokens,
             self.num_cached_tokens,
+            self.num_preeptions,
             self.block_table,
             last_token_or_ids
         ) = state

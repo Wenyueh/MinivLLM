@@ -1,14 +1,43 @@
 from collections import deque
+from dataclasses import dataclass
+
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.engine.block_manager import BlockManager
 
+import torch
+
+
+@dataclass
+class SchedulerOutput:
+    scheduled_seqs: list[Sequence]
+    num_scheduled_tokens: dict[int, int]
+
+    def __getstate__(self):
+        return {
+            'scheduled_seqs': self.scheduled_seqs,
+            'num_scheduled_tokens': self.num_scheduled_tokens
+        }
+    
+    def __setstate__(self, state):
+        self.scheduled_seqs = state['scheduled_seqs']
+        self.num_scheduled_tokens = state['num_scheduled_tokens']
+
 
 class Scheduler:
-    def __init__(self, max_num_sequences: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: int):
+    def __init__(
+            self, 
+            max_num_sequences: int, 
+            max_num_batched_tokens: int, 
+            max_cached_blocks: int,
+            long_prefill_token_threshold: int, 
+            block_size: int, 
+            eos: int
+        ):
         # block manager
         self.block_manager = BlockManager(max_cached_blocks, block_size)
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_sequences = max_num_sequences
+        self.long_prefill_token_threshold = long_prefill_token_threshold
         # sequence queue
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -23,58 +52,106 @@ class Scheduler:
 
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        scheduled_sequences = []
-        current_scheduled_tokens = 0
-        # try schedule for prefilling from waiting queue if not exceeding limits
-        while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
-            seq = self.waiting[0]
-            if self.block_manager.can_allocate(seq) and len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens:
-                seq = self.waiting.popleft() # remove from waiting
-                self.block_manager.allocate(seq)
-                seq.status = SequenceStatus.RUNNING
-                self.running.append(seq)
-                scheduled_sequences.append(seq)
-                current_scheduled_tokens += len(seq)
-            else:
+        scheduled_seqs: list[Sequence] = []
+        preempted_seqs: list[Sequence] = []
+
+        num_scheduled_tokens: dict[int, int] = {}
+        token_budget = self.max_num_batched_tokens
+
+        seq_idx = 0
+        while seq_idx < len(self.running) and token_budget > 0:
+            sequence = self.running[seq_idx]
+
+            # num_new_tokens = (prompt + output) - computed
+            num_new_tokens = sequence.num_tokens - sequence.num_computed_tokens
+            
+            # chunk_prefill
+            if 0 < self.long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = self.long_prefill_token_threshold
+            num_new_tokens = min(num_new_tokens, token_budget)
+
+            while True:
+                # allocate block
+                is_allocated = self.block_manager.allocate(sequence,num_new_tokens)
+                if is_allocated:
+                    break
+                
+                # preempt
+                preempted_seq = self.running.pop()
+                self.preempt(preempted_seq)
+                preempted_seqs.append(preempted_seq)
+                if preempted_seq == sequence:
+                    break
+            
+            if is_allocated == False:
                 break
-        if scheduled_sequences:
-            return scheduled_sequences, True
+
+            scheduled_seqs.append(sequence)
+            num_scheduled_tokens[sequence.seq_id] = num_new_tokens
+            token_budget -= num_new_tokens
+            seq_idx += 1
+
         
-        # try schedule for completion from running queue
-        while self.running:
-            seq = self.running.popleft()
-            # use can_append to check whether we can append one more token
-            if not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
+        if not preempted_seqs: 
+            while self.waiting and token_budget > 0:
+                if len(self.running) == self.max_num_sequences:
                     break
-            else:
-                if current_scheduled_tokens >= self.max_num_batched_tokens or len(scheduled_sequences) >= self.max_num_sequences:
+                sequence = self.waiting[0]
+                
+                # prefix caching
+                cache_hit_blocks, num_new_computed_tokens = self.block_manager.get_cache_hit_tokens(sequence)
+                num_computed_tokens = num_new_computed_tokens
+                num_new_tokens = sequence.num_tokens - num_computed_tokens
+
+                # chunked_prefill
+                if 0 < self.long_prefill_token_threshold < num_new_tokens:
+                    num_new_tokens = self.long_prefill_token_threshold
+                num_new_tokens = min(num_new_tokens, token_budget)
+                assert num_new_tokens > 0  
+
+                # allocate block
+                is_allocated = self.block_manager.allocate(
+                    sequence,
+                    num_new_tokens,
+                    num_new_computed_tokens,
+                    cache_hit_blocks
+                )
+                if is_allocated == False:
                     break
-                # append one token
-                self.block_manager.append(seq)
-                scheduled_sequences.append(seq)
-                current_scheduled_tokens += 1 # only one token for completion
+                
+                # allocate block success
+                sequence = self.waiting.popleft()
+                self.running.append(sequence)
+                scheduled_seqs.append(sequence)
+                num_scheduled_tokens[sequence.seq_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                sequence.status = SequenceStatus.RUNNING
 
-        # re-add to running queue in the same order
-        if scheduled_sequences:
-            self.running.extendleft(reversed(scheduled_sequences))
-
-        return scheduled_sequences, False
+        return SchedulerOutput(scheduled_seqs, num_scheduled_tokens)      
 
 
     def preempt(self, seq: Sequence) -> None:
         self.block_manager.deallocate(seq)
-        seq.status = SequenceStatus.WAITING
-        self.waiting.appendleft(seq)        
+        seq.status = SequenceStatus.PREEMPTED
+        seq.num_computed_tokens = 0
+        seq.num_preeptions += 1
+        self.waiting.appendleft(seq)      
 
 
     # postprocess after generation to check whether sequences are finished
     # if finished, deallocate blocks
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:
+    def postprocess(self, scheduler_output: SchedulerOutput, token_ids: torch.Tensor, discard_seq_ids: list[int]) -> None:
+        seqs: list[Sequence] = scheduler_output.scheduled_seqs
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        token_ids = token_ids.tolist()
         for seq, token_id in zip(seqs, token_ids):
+            num_computed_tokens = num_scheduled_tokens[seq.seq_id]
+
+            if seq.seq_id in discard_seq_ids:
+                seq.num_computed_tokens += num_computed_tokens
+                continue
+
+            seq.num_computed_tokens += num_computed_tokens
             seq.append_token(token_id)
             # Check stopping conditions:
             # EOS token

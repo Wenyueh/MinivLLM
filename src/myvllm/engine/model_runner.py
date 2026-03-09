@@ -1,6 +1,7 @@
 import math
 import torch
 import pickle
+from pathlib import Path
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -9,6 +10,7 @@ from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
+from myvllm.engine.scheduler import SchedulerOutput
 from myvllm.utils import *
 
 class ModelRunner:
@@ -19,15 +21,17 @@ class ModelRunner:
         # set distributed config
         self.block_size = config['block_size']
         self.world_size = config['world_size']
-        self.enforce_eager = config.get('enforce_eager', False)
+        self.enforce_eager = config.get('enforce_eager', True)
 
         self.rank = rank
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
         # set model
-        match config['model_name_or_path']:
-            case 'Qwen/Qwen3-0.6B':
+        path_str = self.config['model_name_or_path']
+        model_name = Path(path_str).name
+        match model_name:
+            case 'Qwen3-0.6B':
                 self.model = Qwen3ForCausalLM(
                     vocab_size=config['vocab_size'],
                     hidden_size=config['hidden_size'],
@@ -45,7 +49,7 @@ class ModelRunner:
                     tie_word_embeddings=config['tie_word_embeddings'],
                     block_size=self.block_size,
                 )
-            case 'meta-llama/Llama-3.2-1B-Instruct':
+            case 'Llama-3.2-1B-Instruct':
                 self.model = LlamaForCausalLM(
                     vocab_size=config['vocab_size'],
                     hidden_size=config['hidden_size'],
@@ -183,11 +187,15 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_tokens = self.config['max_num_batch_tokens']
+        max_tokens = self.config['max_num_batched_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
-        seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
-        self.run(seqs, is_prefill=True)
+        seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.block_size) for _ in range(batch_size)]
+        num_scheduled_tokens: dict[int, int] = {}
+        for seq in seqs:
+            num_scheduled_tokens[seq.seq_id] = seq.num_tokens
+        scheduler_output = SchedulerOutput(seqs, num_scheduled_tokens)      
+        self.run(scheduler_output)
         torch.cuda.empty_cache()
 
     # allocate kv cache memory blocks for model
@@ -208,13 +216,21 @@ class ModelRunner:
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
-        self.num_available_kv_blocks = int(available_mem // block_bytes)
-        assert self.num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
+        self.config['max_cached_blocks'] = int(available_mem // block_bytes)
+        assert self.config['max_cached_blocks'] >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
 
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.num_available_kv_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(
+            2, 
+            self.config['num_layers'], 
+            self.config['max_cached_blocks'], 
+            self.block_size, 
+            num_kv_heads, 
+            head_dim, 
+            device=f'cuda:{self.rank}'
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
@@ -232,85 +248,83 @@ class ModelRunner:
     #               │  │  └──── end of seq2 (position 5)
     #               │  └─────── end of seq1 (position 3)
     #               └────────── start (position 0)
-    def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
+    def _prepare_inputs(self, scheduler_output: SchedulerOutput) -> torch.Tensor:
         # length: sum of all input_ids after prefix cache
         input_ids = []
         # length: sum of all input_ids after prefix cache
         slot_mappings = []
         # length: num_seqs
-        seqlens_q = []
-        # length: num_seqs
-        seqlens_k = []
+        seqlens = []
         # length: num_seqs + 1
-        cu_seqlens_q = [0]
-        # length: num_seqs + 1
-        cu_seqlens_k = [0]
+        cu_seqlens = [0]
+        # length: context seq length
+        context_lens = []
         # block_tables: num_seqs x num_blocks (padded)
         block_tables = []
+        # seq not need to sample  (chunked_prefill)
+        discard_seq_ids = []
+        
+        num_scheduled_tokens: dict[int, int] = scheduler_output.num_scheduled_tokens 
+        seqs = scheduler_output.scheduled_seqs
         for seq in seqs:
             token_ids = seq.token_ids
-            num_cached_tokens = seq.num_cached_tokens
-            input_ids.extend(token_ids[num_cached_tokens:])
-            seqlens_q.append(len(token_ids) - num_cached_tokens)
-            seqlens_k.append(len(token_ids))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
-            if seq.block_table:
-                for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
-                    if seq.num_cached_blocks + i != seq.num_blocks - 1:
-                        slot_mappings.extend(list(range(block_id * self.block_size, (block_id+1) * self.block_size)))
-                    else:
-                        slot_mappings.extend(list(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens)))
-        if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
-            # pad block_tables
-            all_block_tables = [seq.block_table for seq in seqs]
-            max_num_blocks = max(len(bt) for bt in all_block_tables)
+            num_sched_tokens = num_scheduled_tokens.get(seq.seq_id)
+            sched_token_start = seq.num_computed_tokens 
+            sched_token_end = seq.num_computed_tokens + num_sched_tokens
+            input_ids.extend(token_ids[sched_token_start:sched_token_end])
+            seqlens.append(num_sched_tokens)
+            cu_seqlens.append(cu_seqlens[-1] + seqlens[-1])
+            context_lens.append(seq.num_computed_tokens + num_sched_tokens)
+
+            if len(seq.block_table) == 0:
+                # warm-up
+                continue
+
+            if num_sched_tokens + seq.num_computed_tokens < seq.num_tokens:
+                discard_seq_ids.append(seq.seq_id)
+
+            # slot mapping
+            last_computed_block_used_slots = seq.num_computed_tokens % seq.block_size
+            num_computed_blocks = int(math.ceil(seq.num_computed_tokens / seq.block_size))
+            if last_computed_block_used_slots > 0:
+                last_computed_block_id = seq.block_table[num_computed_blocks - 1]
+                last_computed_block_remaining_slots = seq.block_size - last_computed_block_used_slots
+                if num_sched_tokens <= last_computed_block_remaining_slots: 
+                    slot_mappings.extend(list(range(last_computed_block_id * seq.block_size + last_computed_block_used_slots, last_computed_block_id * seq.block_size + last_computed_block_used_slots + num_sched_tokens)))
+                    next_num_tokens = 0
+                else:
+                    slot_mappings.extend(list(range(last_computed_block_id * seq.block_size + last_computed_block_used_slots, (last_computed_block_id + 1) * seq.block_size)))
+                    next_num_tokens = num_sched_tokens - last_computed_block_remaining_slots
+            else:
+                next_num_tokens = num_sched_tokens
+            
+            next_block_num = int(math.ceil(next_num_tokens / seq.block_size))
+            next_last_block_used_slots = next_num_tokens % seq.block_size 
+            for i in range(next_block_num):
+                block_id = seq.block_table[num_computed_blocks + i]
+                if i != next_block_num - 1 or next_last_block_used_slots == 0:
+                    slot_mappings.extend(list(range(block_id * seq.block_size, (block_id + 1) * seq.block_size)))
+                else:
+                    slot_mappings.extend(list(range(block_id * seq.block_size, block_id * seq.block_size + next_last_block_used_slots)))
+
+        # padding block_tables
+        all_block_tables = [seq.block_table for seq in seqs]
+        max_num_blocks = max(len(bt) for bt in all_block_tables)
+        if max_num_blocks != 0:
             for i, seq in enumerate(seqs):
                 block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
                 block_tables.append(block_table)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
 
-        set_context(
-            is_prefill=True,
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            max_seqlen_q=max(seqlens_q),
-            max_seqlen_k=max(seqlens_k),
-            slot_mapping=slot_mapping_tensor,
-            context_lens=None,
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
-        )
-        return input_ids
-
-
-    # prepare input data for decoding
-    def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
-        input_ids = []
-        context_lens = []   
-        slot_mappings = []  
-        block_tables = []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            context_lens.append(len(seq))
-            slot_mappings.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
-        all_block_tables = [seq.block_table for seq in seqs]
-        max_num_blocks = max(len(bt) for bt in all_block_tables)
-        for i, seq in enumerate(seqs):
-            block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
-            block_tables.append(block_table)
+        # set context
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         set_context(
-            is_prefill=False,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=0,
-            max_seqlen_k=0,
+            cu_seqlens_q=torch.tensor(cu_seqlens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            max_seqlen_q=max(seqlens), 
             slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
-        )
-        return input_ids    
+        ) 
+        return input_ids, discard_seq_ids
 
     # prepare the temperature
     def prepare_sample(self, seqs: list[Sequence]) -> None:
@@ -321,8 +335,8 @@ class ModelRunner:
     # allocate input_ids, positions, slot_mapping, context_lens, block_tables, outputs
     # into graph_variable, and then replay the graph
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, is_prefill: bool) -> torch.Tensor:
-        if is_prefill or self.enforce_eager:
+    def run_model(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.enforce_eager:
             # For varlen prefill, keep input_ids as 1D (concatenated tokens)
             # Do NOT unsqueeze - flash_attn_varlen_func expects 1D input with cu_seqlens
             hidden_states = self.model(input_ids)
@@ -353,18 +367,18 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        if is_prefill:
-            input_ids = self.prepare_prefill(seqs)
-        else:
-            input_ids = self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, is_prefill)
+    def run(self, scheduler_output: SchedulerOutput) -> torch.Tensor:
+        seqs = scheduler_output.scheduled_seqs
+        # prepare inputs
+        input_ids, discard_seq_ids = self._prepare_inputs(scheduler_output)
+        # run model
+        logits = self.run_model(input_ids)
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
             token_ids = self.sampler(logits, self.prepare_sample(seqs))
         reset_context()
-        return token_ids
+        return token_ids, discard_seq_ids
 
     # capture the CUDA graph:
     # pre-allocation at maximum sizes: allocated onece and reuse for all graphs
