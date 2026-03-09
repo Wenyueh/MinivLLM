@@ -54,6 +54,7 @@ class Scheduler:
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs: list[Sequence] = []
         preempted_seqs: list[Sequence] = []
+        skipped_waiting_seqs: list[Sequence] = []
 
         num_scheduled_tokens: dict[int, int] = {}
         token_budget = self.max_num_batched_tokens
@@ -91,7 +92,6 @@ class Scheduler:
             token_budget -= num_new_tokens
             seq_idx += 1
 
-        
         if not preempted_seqs: 
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_sequences:
@@ -117,6 +117,8 @@ class Scheduler:
                     cache_hit_blocks
                 )
                 if is_allocated == False:
+                    sequence = self.waiting.popleft()
+                    skipped_waiting_seqs.append(sequence)
                     break
                 
                 # allocate block success
@@ -127,13 +129,17 @@ class Scheduler:
                 token_budget -= num_new_tokens
                 sequence.status = SequenceStatus.RUNNING
 
+        if skipped_waiting_seqs:
+            skipped_waiting_seqs.reverse()
+            self.waiting.extendleft(skipped_waiting_seqs)
+
         return SchedulerOutput(scheduled_seqs, num_scheduled_tokens)      
 
 
     def preempt(self, seq: Sequence) -> None:
+        seq.num_prompt_tokens = seq.num_prompt_tokens + seq.completion_token_ids  # add num of completion tokens
         self.block_manager.deallocate(seq)
         seq.status = SequenceStatus.PREEMPTED
-        seq.num_computed_tokens = 0
         seq.num_preeptions += 1
         self.waiting.appendleft(seq)      
 
