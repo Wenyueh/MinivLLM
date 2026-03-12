@@ -4,6 +4,7 @@ import torch.distributed as dist
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
+torch.set_default_dtype(torch.bfloat16) 
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -15,7 +16,7 @@ from myvllm.sampling_parameters import SamplingParams
 config = {
     # 推理引擎参数
     'max_num_sequences': 16,          # 最大并发处理的prompt数量（同时跑16个对话）
-    'max_num_batched_tokens': 1024,   # 批处理的最大token数（显存优化）
+    'max_num_batched_tokens': 4096,   # 批处理的最大token数（显存优化）
     'max_cached_blocks': 1024,        # KV缓存的最大块数（减少显存占用）
     'block_size': 256,                # KV缓存的块大小（Qwen3的优化参数）
     'world_size': 1,                  # 分布式推理的GPU数量（1=单卡）
@@ -23,8 +24,6 @@ config = {
     # 模型结构参数（匹配Qwen3-0.6B的真实结构）
     # 关键1：保留框架能识别的模型名，让ModelRunner通过这个值识别Qwen3-0.6B
     'model_name_or_path': 'Qwen/Qwen3-0.6B',
-    # 关键2：新增参数，存储本地模型路径
-    'local_model_path': '/home/rejor/Works/CUDA/Qwen3-0.6B',
     'vocab_size': 151936,             # 词表大小（修复：原错误值151643，匹配真实Qwen3）
     'hidden_size': 1024,              # 模型隐藏层维度（Qwen3-0.6B的核心参数）
     'num_heads': 16,                  # 注意力头数
@@ -41,11 +40,10 @@ config = {
     'scale': 1,                       # 注意力缩放系数
     'max_position': 32768,            # RoPE支持的最大位置长度
     'ffn_bias': False,                # FFN层是否有偏置（修复：Qwen3无）
-    'max_num_batch_tokens': 4096,     # 批处理token数上限
-    'max_model_length': 1024,          # 模型支持的总序列长度（prompt+生成内容）
+    'max_model_length': 4096,          # 模型支持的总序列长度（prompt+生成内容）
     'gpu_memory_utilization': 0.9,    # GPU显存利用率上限（用90%的显存）
     'eos': 151645,                    # 生成结束符的token ID（匹配分词器的eos_token_id）
-    'kv_cache_dtype': 'auto', 
+    'kv_cache_dtype': 'int8', 
 }
 
 def main():
@@ -60,31 +58,47 @@ def main():
     )
     llm = LLM(config=config)
     
-    # === 验证代码开始 ===
-    print("\n=== Verifying KV Cache Type ===")
-    # 获取 model_runner (rank 0)
-    runner = llm.model_runner
-    # 遍历模型层，找到第一个 Attention 模块
-    for name, module in runner.model.named_modules():
-        if hasattr(module, 'k_cache'):
-            print(f"Layer: {name}")
-            print(f"  k_cache dtype: {module.k_cache.dtype}")
-            print(f"  k_scale dtype: {module.k_scale.dtype if hasattr(module, 'k_scale') else 'None'}")
-            # 如果启用了 INT8，应该输出:
-            # k_cache dtype: torch.int8
-            # k_scale dtype: torch.float16
-            break
-    print("================================\n")
-    # === 验证代码结束 ===
+    # === 新增：直接在这里测量容量 ===
+    print("\n" + "="*30)
+    print(" KV Cache Capacity Report ")
+    print("="*30)
+    
+    # 获取当前 KV Cache 配置
+    kv_dtype = config.get('kv_cache_dtype', 'bf16')
+    print(f"KV Cache Mode: {kv_dtype}")
+    
+    # 获取实际分配的 Block 数量
+    # 这里的 num_available_kv_blocks 是在 allocate_kv_cache 中计算出来的
+    if hasattr(llm.model_runner, 'num_available_kv_blocks'):
+        num_blocks = llm.model_runner.num_available_kv_blocks
+        block_size = config['block_size']
+        max_tokens = num_blocks * block_size
+        
+        print(f"Max KV Blocks Allocated: {num_blocks}")
+        print(f"Max Context Tokens:      {max_tokens}")
+        
+        # 理论值计算参考
+        # 28层, 8个KV头, 128维度
+        # BF16: 2 bytes * 2 (K+V) * 28 * 8 * 128 * block_size
+        # INT8: 1 byte * ... (约为一半)
+        print(f"Theoretical VRAM Saved:  ~50% vs BF16")
+    else:
+        print("Cannot access block info.")
+
+    # 显存占用
+    allocated = torch.cuda.memory_allocated() / (1024**3)
+    print(f"GPU Memory Allocated:    {allocated:.2f} GB")
+    print("="*30 + "\n")
+    # === 测量代码结束 ===
 
     # max_tokens is the max number of generated tokens
     # max_model_length is the max total length including prompt
     # both should be set in SamplingParams and help to determine when to stop generation
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=1024, max_model_length=1024)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=4096, max_model_length=4096)
     prompts = [
-        "introduce yourself",# * 15,
-        "list all prime numbers within 100",# * 15,
-        "give me your opinion on the impact of artificial intelligence on society",# * 15,
+        #"introduce yourself",# * 15,
+        "请列出1到100之间所有的质数：",# * 15,
+        #"give me your opinion on the impact of artificial intelligence on society",# * 15,
     ] #* 30
     prompts = [
         tokenizer.apply_chat_template(

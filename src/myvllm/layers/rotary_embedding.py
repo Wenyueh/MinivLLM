@@ -103,6 +103,10 @@ class RotaryEmbedding(nn.Module):
     def forward(self, positions, query, key):
         cos_sin = self.cos_sin_cache[positions]  # (seq_len, rotary_embedding)
         cos, sin = cos_sin.chunk(2, dim=-1)
+        # 关键修复：将 cos/sin 转换为与 query 相同的数据类型
+        # 这样可以避免混合精度计算导致的类型提升
+        cos = cos.to(query.dtype)
+        sin = sin.to(query.dtype)
         return (
             apply_rotary_pos_emb(query, cos, sin),
             apply_rotary_pos_emb(key, cos, sin)

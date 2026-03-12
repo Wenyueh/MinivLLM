@@ -9,4 +9,4 @@ class SamplingParams:
     max_model_length: int | None = None  # Maximum total sequence length (prompt + completion)
 
     def __post_init__(self):
-        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+        assert self.temperature >= 0, "greedy sampling is not permitted"

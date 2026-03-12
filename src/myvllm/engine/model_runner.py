@@ -185,7 +185,7 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_tokens = self.config['max_num_batch_tokens']
+        max_tokens = self.config['max_num_batched_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
@@ -243,7 +243,7 @@ class ModelRunner:
                 2, self.config['num_layers'], self.num_available_kv_blocks,
                 self.block_size, num_kv_heads,
                 device=f'cuda:{self.rank}',
-                dtype=self.default_dtype # Scale 通常使用 FP16/BF16
+                dtype=torch.float16 # Scale 通常使用 FP16/BF16
             )
         else:
             # 默认分配逻辑
@@ -255,7 +255,7 @@ class ModelRunner:
             )
             # 关键修复：为非量化模式分配一个虚拟的 Scale Cache (1x1x... 占位)
             # 这是为了避免 Triton Kernel 接收到空指针而崩溃
-            allocated_kv_scale = torch.zeros(1, device=f'cuda:{self.rank}', dtype=self.default_dtype)
+            allocated_kv_scale = torch.zeros(1, device=f'cuda:{self.rank}', dtype=torch.float16)
 
         layer_id = 0
         for module in self.model.modules():
@@ -273,11 +273,6 @@ class ModelRunner:
                     module.v_scale = allocated_kv_scale
                 layer_id += 1
                 
-        # 在函数末尾添加显存打印
-        allocated_mem = torch.cuda.memory_allocated(self.rank) / (1024 ** 3)
-        print(f"[Rank {self.rank}] KV Cache allocated. Type: {self.kv_cache_dtype}")
-        print(f"[Rank {self.rank}] Current GPU Memory Used: {allocated_mem:.2f} GB")
-
     # given seqs
     # prepare the data needed for a prefill forward pass
     # taking prefix cache into consideration: 

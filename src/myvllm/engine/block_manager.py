@@ -66,7 +66,7 @@ class BlockManager:
 
     def allocate(self, seq: Sequence) -> None:
         h = -1
-        for i in range(seq.num_blocks):
+        for i in range(seq.num_blocks): # 遍历序列需要的所有Block数
             no_cache_found = False
 
             token_ids = seq.block(i)
