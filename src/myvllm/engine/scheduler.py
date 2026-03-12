@@ -28,6 +28,9 @@ class Scheduler:
         # try schedule for prefilling from waiting queue if not exceeding limits
         while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
             seq = self.waiting[0]
+            # 关键检查点：
+            # 1. 显存检查：block_manager 能否为新请求分配 KV Cache？
+            # 2. 算力检查：加上新请求的 prompt 长度，是否超过 max_num_batched_tokens？
             if self.block_manager.can_allocate(seq) and len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens:
                 seq = self.waiting.popleft() # remove from waiting
                 self.block_manager.allocate(seq)
@@ -66,9 +69,9 @@ class Scheduler:
 
 
     def preempt(self, seq: Sequence) -> None:
-        self.block_manager.deallocate(seq)
+        self.block_manager.deallocate(seq) # 释放显存
         seq.status = SequenceStatus.WAITING
-        self.waiting.appendleft(seq)        
+        self.waiting.appendleft(seq) # 放回等待队列头部
 
 
     # postprocess after generation to check whether sequences are finished

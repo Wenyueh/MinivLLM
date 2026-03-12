@@ -20,50 +20,52 @@ class ModelRunner:
         self.block_size = config['block_size']
         self.world_size = config['world_size']
         self.enforce_eager = config.get('enforce_eager', False)
+        self.kv_cache_dtype = config.get('kv_cache_dtype', 'auto')
 
         self.rank = rank
         dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
 
         # set model
-        match config['model_name_or_path']:
-            case 'Qwen/Qwen3-0.6B':
-                self.model = Qwen3ForCausalLM(
-                    vocab_size=config['vocab_size'],
-                    hidden_size=config['hidden_size'],
-                    num_heads=config['num_heads'],
-                    head_dim=config['head_dim'],
-                    scale=config['scale'],
-                    num_kv_heads=config['num_kv_heads'],
-                    rms_norm_epsilon=config['rms_norm_epsilon'],
-                    qkv_bias=config['qkv_bias'],
-                    base=config['base'],
-                    max_position=config['max_position'],
-                    intermediate_size=config['intermediate_size'],
-                    ffn_bias=config['ffn_bias'],
-                    num_layers=config['num_layers'],
-                    tie_word_embeddings=config['tie_word_embeddings'],
-                    block_size=self.block_size,
-                )
-            case 'meta-llama/Llama-3.2-1B-Instruct':
-                self.model = LlamaForCausalLM(
-                    vocab_size=config['vocab_size'],
-                    hidden_size=config['hidden_size'],
-                    head_dim=config['head_dim'],
-                    num_qo_heads=config['num_qo_heads'],
-                    num_kv_heads=config['num_kv_heads'],
-                    has_attn_bias=config['has_attn_bias'],
-                    rms_norm_epsilon=config['rms_norm_epsilon'],
-                    rope_base=config['rope_base'],
-                    max_position_embeddings=config['max_position_embeddings'],
-                    intermediate_size=config['intermediate_size'],
-                    ffn_bias=config['ffn_bias'],
-                    num_layers=config['num_layers'],
-                    block_size=self.block_size,
-                    tie_word_embeddings=config['tie_word_embeddings'],
-                )
-            case _:
-                raise Exception(f"Unsupported model: {config['model_name_or_path']}")
+        model_path = config['model_name_or_path']
+        # 改为「包含子串匹配」，兼容本地路径和线上模型名
+        if 'Qwen3-0.6B' in model_path:
+            self.model = Qwen3ForCausalLM(
+                vocab_size=config['vocab_size'],
+                hidden_size=config['hidden_size'],
+                num_heads=config['num_heads'],
+                head_dim=config['head_dim'],
+                scale=config['scale'],
+                num_kv_heads=config['num_kv_heads'],
+                rms_norm_epsilon=config['rms_norm_epsilon'],
+                qkv_bias=config['qkv_bias'],
+                base=config['base'],
+                max_position=config['max_position'],
+                intermediate_size=config['intermediate_size'],
+                ffn_bias=config['ffn_bias'],
+                num_layers=config['num_layers'],
+                tie_word_embeddings=config['tie_word_embeddings'],
+                block_size=self.block_size,
+            )
+        elif 'Llama-3.2-1B-Instruct' in model_path:
+            self.model = LlamaForCausalLM(
+                vocab_size=config['vocab_size'],
+                hidden_size=config['hidden_size'],
+                head_dim=config['head_dim'],
+                num_qo_heads=config['num_qo_heads'],
+                num_kv_heads=config['num_kv_heads'],
+                has_attn_bias=config['has_attn_bias'],
+                rms_norm_epsilon=config['rms_norm_epsilon'],
+                rope_base=config['rope_base'],
+                max_position_embeddings=config['max_position_embeddings'],
+                intermediate_size=config['intermediate_size'],
+                ffn_bias=config['ffn_bias'],
+                num_layers=config['num_layers'],
+                block_size=self.block_size,
+                tie_word_embeddings=config['tie_word_embeddings'],
+            )
+        else:
+            raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
         # Load weights in GPU (model moved to GPU before loading weights)
         self.model = self.model.cuda(rank)
@@ -183,7 +185,7 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_tokens = self.config['max_num_batch_tokens']
+        max_tokens = self.config['max_num_batched_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
@@ -205,23 +207,72 @@ class ModelRunner:
         num_kv_heads = self.config['num_kv_heads'] // self.world_size
         head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
 
-        # check whether the current free memory can hold at least one block
-        # compute the actual byte required of each block
-        block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
+        # 修改部分开始：根据量化类型计算显存占用
+        if self.kv_cache_dtype == 'int8':
+            # INT8 模式：KV主体是 int8 (1 byte)，Scale是 float16 (2 bytes)
+            # Scale 的维度通常是对每个 token 的每个 head 一个 scale
+            # 注意：vLLM 实现中 Scale 通常与 Block 内的 token 对应
+            kv_bytes_per_element = 1 
+            scale_bytes_per_token = 2 * 2 # K scale + V scale (fp16)
+            # 每个 token 的 KV 显存: (num_layers * 2 * num_kv_heads * head_dim * 1) + (num_layers * 2 * num_kv_heads * 2)
+            block_bytes = self.block_size * num_layers * (
+                2 * num_kv_heads * head_dim * kv_bytes_per_element + 
+                2 * num_kv_heads * scale_bytes_per_token 
+            )
+            # 相比纯 FP16，显存大约减少一半 (FP16: 2 bytes * 2 (K+V) = 4; INT8: 1 * 2 + 0.25 * 2 = 2.5)
+        else:
+            # 默认 FP16/BF16 模式
+            kv_bytes_per_element = self.default_dtype.itemsize
+            block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * kv_bytes_per_element
+        
         self.num_available_kv_blocks = int(available_mem // block_bytes)
         assert self.num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
 
-        # allocate max possible kv cache for the model, instead for each sequence
-        # this is the key for paged attention: one giant KV cache pool, divided into blocks
-        # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.num_available_kv_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        # 修改部分开始：根据量化类型分配张量
+        if self.kv_cache_dtype == 'int8':
+            # 分配 INT8 KV Cache: (2, num_layers, num_blocks, block_size, num_kv_heads, head_dim)
+            allocated_kv_cache = torch.zeros(
+                2, self.config['num_layers'], self.num_available_kv_blocks, 
+                self.block_size, num_kv_heads, head_dim, 
+                device=f'cuda:{self.rank}', 
+                dtype=torch.int8
+            )
+            # 分配 Scale Cache: (2, num_layers, num_blocks, block_size, num_kv_heads)
+            # Scale 不需要 head_dim 维度，因为是对整个 head_vec 进行的缩放
+            allocated_kv_scale = torch.zeros(
+                2, self.config['num_layers'], self.num_available_kv_blocks,
+                self.block_size, num_kv_heads,
+                device=f'cuda:{self.rank}',
+                dtype=torch.float16 # Scale 通常使用 FP16/BF16
+            )
+        else:
+            # 默认分配逻辑
+            allocated_kv_cache = torch.zeros(
+                2, self.config['num_layers'], self.num_available_kv_blocks, 
+                self.block_size, num_kv_heads, head_dim, 
+                device=f'cuda:{self.rank}', 
+                dtype=self.default_dtype
+            )
+            # 关键修复：为非量化模式分配一个虚拟的 Scale Cache (1x1x... 占位)
+            # 这是为了避免 Triton Kernel 接收到空指针而崩溃
+            allocated_kv_scale = torch.zeros(1, device=f'cuda:{self.rank}', dtype=torch.float16)
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
+                
+                # 关键修复：总是注入 scale cache
+                if self.kv_cache_dtype == 'int8':
+                    module.k_scale = allocated_kv_scale[0, layer_id]
+                    module.v_scale = allocated_kv_scale[1, layer_id]
+                else:
+                    # 非量化模式下，注入那个虚拟的占位 Tensor
+                    module.k_scale = allocated_kv_scale
+                    module.v_scale = allocated_kv_scale
                 layer_id += 1
-
+                
     # given seqs
     # prepare the data needed for a prefill forward pass
     # taking prefix cache into consideration: 
