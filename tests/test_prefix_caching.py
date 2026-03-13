@@ -1,24 +1,21 @@
-import sys, os
+import sys
 from pathlib import Path
-import torch.distributed as dist
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
+from transformers import AutoTokenizer
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.engine.llm_engine import LLMEngine as LLM
 from myvllm.sampling_parameters import SamplingParams
 
 config = {
     'max_num_sequences': 16,
-    'max_num_batched_tokens': 2048,
+    'max_num_batched_tokens': 1024,
     'max_cached_blocks': 1024,
-    'block_size': 256,
+    'block_size': 16,
     'world_size': 1,
-    'model_name_or_path': 'Qwen/Qwen3-0.6B',
+    'model_name_or_path': '/home/models/Qwen/Qwen3-0.6B',
     'enforce_eager': True,
     'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
     'hidden_size': 1024,
@@ -40,21 +37,25 @@ config = {
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
 }
 
-def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+def test_prefix_caching():
     model_name = config.get('model_name_or_path', 'Qwen/Qwen3-0.6B')
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=path)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     llm = LLM(config=config)
     
-    # max_tokens is the max number of generated tokens
-    # max_model_length is the max total length including prompt
-    # both should be set in SamplingParams and help to determine when to stop generation
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
-    prompts = [
-        "introduce yourself",# * 15,
-        "list all prime numbers within 100",# * 15,
-        "give me your opinion on the impact of artificial intelligence on society",# * 15,
-    ]# * 30
+    sampling_params = SamplingParams(temperature=1, max_tokens=256, max_model_length=128)
+    
+    prompts0 = [
+        "introduce yourself",
+        "list all prime numbers within 100",
+        "give me your opinion on the impact of artificial intelligence on society",
+    ] * 30
+
+    prompts1 = [
+        "introduce yourself" * 15,
+        "list all prime numbers within 100" * 15,
+        "give me your opinion on the impact of artificial intelligence on society" * 15,
+    ] * 30 
+    prompts = prompts0 + prompts1
 
     prompts = [
         tokenizer.apply_chat_template(
@@ -65,18 +66,7 @@ def main():
         for prompt in prompts
     ]
     outputs, metric = llm.generate(prompts, sampling_params)
-
-    # outputs is a dict with 'text' and 'token_ids' keys
-    generated_texts = outputs['text']
-
-    for prompt, output in zip(prompts, generated_texts):
-        print("\n")
-        print(f"Prompt: {prompt}")
-        print(f"Completion: {output}")
     print(metric)
 
-    
-
-
 if __name__ == "__main__":
-    main()
+    test_prefix_caching()
