@@ -64,7 +64,6 @@ class LLMEngine:
     def step(self, metric: Metrics) -> tuple[list[int], bool]:
         scheduled_sequences, is_prefill = self.scheduler.schedule()
         if not scheduled_sequences:
-            print(is_prefill)
             return [], is_prefill
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
