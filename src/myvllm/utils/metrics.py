@@ -139,6 +139,7 @@ class Metrics:
 
     def __str__(self) -> str:
         """ 返回指标的字符串表示 """
+        num_finished_seqs = len([seq for seq in self.seqs.values() if seq.is_finished])
         input_tps_val = self.input_tps()
         output_tps_val = self.output_tps()
         ttft_metrics = self.ttft()
@@ -150,30 +151,27 @@ class Metrics:
 {'=' * 80}
 Metrics Report
 {'=' * 80}
+{'-' * 30} Inference Results {'-' * 30}
+Number of Sequences: {len(self.seqs)}
+Number of Finished Sequences: {num_finished_seqs}
+Total Input Tokens: {self.num_input_tokens}
+Total Output Tokens: {self.num_output_tokens}
+Input Tokens Per Second: {input_tps_val:.2f} tokens/sec
 Output Tokens Per Second: {output_tps_val:.2f} tokens/sec
-{'-' * 80}
-Time To First Token (TTFT):
+{'-' * 26}Time To First Token(TTFT):{'-' * 28}
 - P50: {ttft_metrics['p50']:.2f} ms
 - P90: {ttft_metrics['p90']:.2f} ms
 - P95: {ttft_metrics['p95']:.2f} ms
 - P99: {ttft_metrics['p99']:.2f} ms
-{'-' * 80}
-Time Per Output Token (TPOT):
+{'-' * 26}Time Per Output Token(TPOT):{'-' * 26}
 - Mean: {tpot_metrics['mean']:.2f} ms/token
 - P50: {tpot_metrics['p50']:.2f} ms/token
 - P90: {tpot_metrics['p90']:.2f} ms/token
 - P95: {tpot_metrics['p95']:.2f} ms/token
 - P99: {tpot_metrics['p99']:.2f} ms/token
-{'-' * 80}
+{'-' * 30}Prefix Caching Hit:{'-' * 32}
 Prefix Cache Hit Rate: {prefix_cache_hit_rate:.4f}
-{'-' * 80}
 Prefix Cache Token Savings Rate: {prefix_cache_token_savings_rate:.4f}
-{'-' * 80}
-Total Input Tokens: {self.num_input_tokens}
-{'-' * 80}
-Total Output Tokens: {self.num_output_tokens}
-{'-' * 80}
-Number of Sequences: {len(self.seqs)}
 {'=' * 80}
 """.strip()
         return result
