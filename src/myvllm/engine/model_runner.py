@@ -3,6 +3,7 @@ import torch
 import pickle
 from pathlib import Path
 import torch.distributed as dist
+from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -27,7 +28,8 @@ class ModelRunner:
         torch.cuda.set_device(rank)
 
         # set model
-        model_name = Path(config['model_name_or_path']).name
+        path_str = self.config['model_name_or_path']
+        model_name = Path(path_str).name
         match model_name:
             case 'Qwen3-0.6B':
                 self.model = Qwen3ForCausalLM(
@@ -213,7 +215,13 @@ class ModelRunner:
         num_available_kv_blocks = int(available_mem // block_bytes)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         
-        # multi model_runner sync
+        # Synchronize max_cached_blocks across all ranks.
+        # Each rank independently computed num_available_kv_blocks from its own
+        # free GPU memory. Ranks may differ slightly: rank-0 carries extra overhead
+        # (NCCL buffers, process-group state) so it often has less free memory than
+        # workers. Without sync, the scheduler (which runs only on rank-0) would use
+        # rank-0's local value and could allocate more blocks than some rank can hold,
+        # causing an OOM on that rank during KV cache writes.
         if self.world_size > 1:
             print(f"[Rank {self.rank}] Local max_cached_blocks: {num_available_kv_blocks}")
             per_rank_max_blocks_tensor = torch.tensor(
@@ -221,9 +229,15 @@ class ModelRunner:
                 dtype=torch.long,
                 device=f'cuda:{self.rank}'
             )
+            # all_reduce with MIN: every rank learns the most conservative limit,
+            # i.e. the block count that even the most memory-constrained rank can serve.
+            # This single agreed-upon value is then stored in config so the Scheduler
+            # (initialized afterwards on rank-0) never allocates more blocks than any
+            # rank can physically hold.
             dist.all_reduce(per_rank_max_blocks_tensor, op=dist.ReduceOp.MIN)
             self.config['max_cached_blocks'] = per_rank_max_blocks_tensor.item()
         else:
+            # Single GPU: no cross-rank sync needed; use the local value directly.
             self.config['max_cached_blocks'] = num_available_kv_blocks
         if self.rank == 0:
             print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")

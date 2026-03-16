@@ -40,7 +40,11 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, rank=0, event=self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
         
-        # scheduler needs to init after model_runner
+        # scheduler needs to init after model_runner: when world_size > 1,
+        # ModelRunner.__init__ calls dist.init_process_group() which is a
+        # collective barrier — rank-0 blocks until all worker ranks have joined.
+        # The scheduler should only be created after that rendezvous completes.
+        # When world_size == 1 there is no barrier and no real dependency.
         self.scheduler = Scheduler(
             max_num_sequences=config.get("max_num_sequences", 16),
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
@@ -48,6 +52,7 @@ class LLMEngine:
             block_size=config.get("block_size", 256),
             eos=config.get("eos", 50256)
         )
+
         atexit.register(self.exit)
 
 
@@ -67,6 +72,9 @@ class LLMEngine:
             return [], is_prefill
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
+        # Move outputs to CPU and convert them to a list
+        if outputs is not None:
+            outputs = outputs.cpu().tolist()
         # postprocess the outputs
         outputs = outputs.cpu().tolist()
         self.scheduler.postprocess(scheduled_sequences, outputs)

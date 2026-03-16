@@ -734,7 +734,17 @@ Path: [llm_engine.py](src/myvllm/engine/llm_engine.py)
 
 ---
 
-### 6.2 Cleanup
+### 6.2 Initialization Order
+
+**Why does the Scheduler init after the ModelRunner?**
+
+When `world_size > 1`, `ModelRunner.__init__` calls `dist.init_process_group('nccl', ...)`, which is a **collective barrier** — rank-0 blocks until every worker process has also called it. Only once all ranks have joined the process group does `ModelRunner.__init__` return. The Scheduler is created after that, ensuring the distributed environment is fully established before the engine is considered ready.
+
+When `world_size == 1` no worker processes are spawned and there is no barrier, so the ordering has no practical effect in that case.
+
+---
+
+### 6.3 Cleanup
 
 **Why `exit()` and `atexit.register(self.exit)`?**
 ```python
