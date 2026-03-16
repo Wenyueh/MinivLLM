@@ -294,87 +294,94 @@ def paged_attention_decode_kernel(
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     max_num_blocks: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     """
-    Paged attention kernel for decode phase.
-    Iterates over logical blocks so each iteration maps to exactly one physical block.
+    Optimized paged attention kernel for decode phase.
+    Processes KV cache in chunks.
     """
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
-
+    
     # Determine which KV head this query head uses (for GQA)
     kv_head_idx = head_idx // (num_heads // num_kv_heads)
-
+    
     # Load context length
     context_len = tl.load(context_lens_ptr + batch_idx)
-
+    
     # Load query: (batch_size, num_heads, head_dim)
     offs_d = tl.arange(0, head_dim)
     q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
     q = tl.load(query_ptr + q_offset)
-
+    
     # Initialize accumulators
     acc = tl.zeros([head_dim], dtype=tl.float32)
     l_i = 0.0
     m_i = -1e10
-
-    # Local offsets within a block — fixed range [0, block_size)
-    local_offs = tl.arange(0, block_size)
-
-    # Iterate one logical block at a time so each maps to exactly one physical block
-    for block_idx in range(max_num_blocks):
-        token_start = block_idx * block_size
-
-        # Triton does not support break; guard the body instead
+    
+    # Calculate total number of chunks to process
+    max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
+    
+    # Process all tokens in chunks
+    for chunk_idx in range(max_chunks):
+        # Global token index for this chunk
+        token_start = chunk_idx * BLOCK_N
+        
+        # Only process if within valid range
         if token_start < context_len:
-            # Global token positions for this block (used for masking only)
-            global_offs = token_start + local_offs
-            mask_n = global_offs < context_len
-
-            # Resolve physical block — single lookup shared by K and V
+            # Determine which tokens in this chunk are valid
+            offs_n = token_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < context_len
+            
+          
+            # Compute attention scores for this chunk
+            qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
+            
+            # Load K for each position and compute scores
+            block_idx = (token_start) // block_size
             physical_block_idx = tl.load(block_tables_ptr + batch_idx * max_num_blocks + block_idx)
-
-            if physical_block_idx != -1:
-                # Cache layout: (num_blocks, block_size, num_kv_heads, head_dim)
-                # local_offs indexes position *within* the physical block
-                block_base = physical_block_idx * block_size * num_kv_heads * head_dim
-
-                # Load K: shape (head_dim, block_size)
-                k_offset = (block_base
-                            + local_offs[None, :] * num_kv_heads * head_dim
-                            + kv_head_idx * head_dim
-                            + offs_d[:, None])
-                k = tl.cast(tl.load(k_cache_ptr + k_offset, mask=mask_n[None, :], other=0.0), tl.float32)
-
-                # Attention scores: dot(q, k) scaled
-                score = tl.sum(q[:, None] * k, axis=0) * scale
+            if physical_block_idx!=-1 :
+                # 物理块地址中读出BLOCK_M token的kv
+                k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim # 块开始位置
+                            + offs_n[None,:] * num_kv_heads * head_dim
+                            + kv_head_idx * head_dim 
+                            + offs_d[:,None])
+                k = tl.load(k_cache_ptr + k_offset, mask=mask_n[None,:],other=0.0)
+                k = tl.cast(k,tl.float32)
+                score = tl.sum(q[:,None] * k, axis=0) * scale
                 qk = tl.where(mask_n, score, -1e10)
-
-                # Online softmax update
-                m_ij = tl.max(qk)
-                m_i_new = tl.maximum(m_i, m_ij)
-                alpha = tl.exp(m_i - m_i_new)
-                p = tl.exp(qk - m_i_new)
-
-                # Rescale previous accumulator
-                acc = acc * alpha
-                l_i = l_i * alpha
-
-                # Load V: shape (block_size, head_dim)
-                v_offset = (block_base
-                            + local_offs[:, None] * num_kv_heads * head_dim
-                            + kv_head_idx * head_dim
-                            + offs_d[None, :])
-                v = tl.cast(tl.load(v_cache_ptr + v_offset, mask=mask_n[:, None], other=0.0), tl.float32)
-
+            
+            # Online softmax
+            m_ij = tl.max(qk)
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new)
+            
+            # Rescale accumulator
+            acc = acc * alpha
+            l_i = l_i * alpha
+            
+            # Load V for each position and compute result
+            block_idx = (token_start) // block_size
+            physical_block_idx = tl.load(block_tables_ptr + batch_idx * max_num_blocks + block_idx)
+            if physical_block_idx!=-1 :
+                # 物理块地址中读出BLOCK_M token的kv
+                v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim # 块开始位置
+                            + offs_n[None,:] * num_kv_heads * head_dim
+                            + kv_head_idx * head_dim 
+                            + offs_d[:,None])
+                v = tl.load(v_cache_ptr + v_offset, mask=mask_n[None,:],other=0.0)
+                v = tl.cast(v,tl.float32)
                 weight = tl.where(mask_n, p, 0.0)
-                acc = acc + tl.sum(weight[:, None] * v, axis=0)
+                acc = acc + tl.sum(weight[None,:] * v,axis=1)
                 l_i = l_i + tl.sum(weight)
-
-                m_i = m_i_new
-
-    # Normalize and store
+            
+            m_i = m_i_new
+    
+    # Normalize
     output = acc / l_i
+    
+    # Store output
     output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
     tl.store(output_ptr + output_offset, output)
 
@@ -407,14 +414,17 @@ def paged_attention_decode(
     """
     batch_size = query.shape[0]
     max_num_blocks = block_tables.shape[1]
-
+    
     # Make contiguous
     query = query.contiguous()
-
+    
     output = torch.empty_like(query)
-
+    
+    # Chunk size for processing KV tokens
+    BLOCK_N = 64 if head_dim <= 128 else 32
+    
     grid = (batch_size, num_heads)
-
+    
     paged_attention_decode_kernel[grid](
         output,
         query,
@@ -428,6 +438,7 @@ def paged_attention_decode(
         head_dim=head_dim,
         block_size=block_size,
         max_num_blocks=max_num_blocks,
+        BLOCK_N=BLOCK_N,
     )
     
     return output
