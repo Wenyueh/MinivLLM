@@ -746,7 +746,17 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ---
 
-### 6.2 清理
+### 6.2 初始化顺序
+
+**为什么 Scheduler 要在 ModelRunner 之后初始化？**
+
+当 `world_size > 1` 时，`ModelRunner.__init__` 会调用 `dist.init_process_group('nccl', ...)`，这是一个**集合屏障（collective barrier）**——rank-0 会阻塞，直到所有 worker 进程也完成该调用后才继续执行。只有在所有 rank 都完成汇合后，`ModelRunner.__init__` 才会返回。Scheduler 在此之后创建，确保分布式环境完全就绪后引擎才进入可用状态。
+
+当 `world_size == 1` 时，不会启动任何 worker 进程，也不存在屏障，因此此时初始化顺序没有实际影响。
+
+---
+
+### 6.3 清理
 
 **为什么要 `exit()` 以及 `atexit.register(self.exit)`？**
 ```python

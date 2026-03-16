@@ -46,12 +46,14 @@ class Scheduler:
             # use can_append to check whether we can append one more token
             if not self.block_manager.can_append(seq):
                 if self.running:
+                    self.running.appendleft(seq)
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
                     break
             else:
                 if current_scheduled_tokens >= self.max_num_batched_tokens or len(scheduled_sequences) >= self.max_num_sequences:
+                    self.running.appendleft(seq)
                     break
                 # append one token
                 self.block_manager.append(seq)

@@ -24,13 +24,6 @@ def worker_process(config, rank, event):
 
 class LLMEngine:
     def __init__(self, config: dict):
-        self.scheduler = Scheduler(
-            max_num_sequences=config.get("max_num_sequences", 16),
-            max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
-            max_cached_blocks=config.get("max_cached_blocks", 1024),
-            block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256)
-        )
         world_size = config.get("world_size", 1)
         ctx = mp.get_context("spawn")
         self.processes = []
@@ -44,6 +37,20 @@ class LLMEngine:
         # start the engine only on the master thread with rank = 0
         self.model_runner = ModelRunner(config, rank=0, event=self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.get("model_name_or_path", "gpt2"))
+        
+        # scheduler needs to init after model_runner: when world_size > 1,
+        # ModelRunner.__init__ calls dist.init_process_group() which is a
+        # collective barrier — rank-0 blocks until all worker ranks have joined.
+        # The scheduler should only be created after that rendezvous completes.
+        # When world_size == 1 there is no barrier and no real dependency.
+        self.scheduler = Scheduler(
+            max_num_sequences=config.get("max_num_sequences", 16),
+            max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
+            max_cached_blocks=config.get("max_cached_blocks", 1024),
+            block_size=config.get("block_size", 256),
+            eos=config.get("eos", 50256)
+        )
+
         atexit.register(self.exit)
 
 
