@@ -19,7 +19,7 @@ config = {
     'block_size': 256,
     'world_size': 1,
     'model_name_or_path': 'Qwen/Qwen3-0.6B',
-    'enforce_eager': True,
+    'enforce_eager': False,
     'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
     'hidden_size': 1024,
     'num_heads': 16,
