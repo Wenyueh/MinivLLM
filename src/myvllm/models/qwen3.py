@@ -16,7 +16,7 @@ class Qwen3Attention(nn.Module):
         head_dim: int,
         scale: float = 1.0,
         num_kv_heads: int | None = None,
-        rms_norm_epsilon: float = 1e-5,
+        rms_norm_epsilon: float = 1e-6,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
@@ -47,8 +47,8 @@ class Qwen3Attention(nn.Module):
         self.qkv_bias = qkv_bias
 
         # Q and K norms as used in Qwen3
-        self.q_norm = LayerNorm(torch.ones(head_dim))
-        self.k_norm = LayerNorm(torch.ones(head_dim))
+        self.q_norm = LayerNorm(torch.ones(head_dim), eps=rms_norm_epsilon)
+        self.k_norm = LayerNorm(torch.ones(head_dim), eps=rms_norm_epsilon)
 
         self.rotary_emb = RotaryEmbedding(
             base=base,
@@ -167,7 +167,7 @@ class Qwen3DecoderLayer(nn.Module):
         head_dim: int,
         scale: float = 1.0,
         num_kv_heads: int | None = None,
-        rms_norm_epsilon: float = 1e-5,
+        rms_norm_epsilon: float = 1e-6,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
@@ -177,7 +177,7 @@ class Qwen3DecoderLayer(nn.Module):
     ):
         super().__init__()
         gamma = torch.ones(hidden_size)
-        self.input_layernorm = LayerNorm(gamma)
+        self.input_layernorm = LayerNorm(gamma, eps=rms_norm_epsilon)
         self.self_attn = Qwen3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -190,7 +190,7 @@ class Qwen3DecoderLayer(nn.Module):
             max_position=max_position,
             block_size=block_size,
         )
-        self.post_attention_layernorm = LayerNorm(gamma)
+        self.post_attention_layernorm = LayerNorm(gamma, eps=rms_norm_epsilon)
         self.mlp = Qwen3MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -240,7 +240,7 @@ class Qwen3Model(nn.Module):
         head_dim: int,
         scale: float = 1.0,
         num_kv_heads: int | None = None,
-        rms_norm_epsilon: float = 1e-5,
+        rms_norm_epsilon: float = 1e-6,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
@@ -271,7 +271,7 @@ class Qwen3Model(nn.Module):
             ) for _ in range(num_layers)
         ])
         gamma = torch.ones(hidden_size)
-        self.norm = LayerNorm(gamma)
+        self.norm = LayerNorm(gamma, eps=rms_norm_epsilon)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
@@ -301,7 +301,7 @@ class Qwen3ForCausalLM(nn.Module):
         head_dim: int | None = None,
         scale: float = 1.0,
         num_kv_heads: int | None = None,
-        rms_norm_epsilon: float = 1e-5,
+        rms_norm_epsilon: float = 1e-6,
         qkv_bias: bool = False,
         base: int = 10000,
         max_position: int = 16384,
