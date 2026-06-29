@@ -48,6 +48,7 @@ class BlockManager:
         block = self.blocks[block_id]
         assert block.ref_count == 0, "Block is already allocated"
         block.reset()
+        block.ref_count = 1
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return block
