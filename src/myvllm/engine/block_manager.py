@@ -110,7 +110,7 @@ class BlockManager:
     # this is to check whether we can append tokens to this sequence
     # when that token would require allocating a new block.
     def can_append(self, seq: Sequence) -> bool:
-        if seq.num_tokens % self.block_size == 0:
+        if seq.num_blocks > len(seq.block_table):
             return len(self.free_block_ids) > 0
         return True
 
