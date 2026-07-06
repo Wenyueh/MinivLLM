@@ -69,6 +69,8 @@ class Sequence:
 
     @property
     def last_block_num_tokens(self):
+        if hasattr(self, "_last_block_num_tokens"):
+            return self._last_block_num_tokens
         full_blocks = int(math.floor(self.num_tokens / self.block_size))
         return len(self.token_ids[full_blocks * self.block_size : ])
 
@@ -87,29 +89,13 @@ class Sequence:
         self.num_tokens += 1 
 
     def __getstate__(self):
-        return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
-            self.num_cached_tokens, 
-            self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
-        )
+        state = self.__dict__.copy()
+        # Decode workers only need the latest token. Keep the existing compact
+        # shared-memory representation while preserving all other attributes.
+        if self.num_completion_tokens > 0:
+            state["_last_block_num_tokens"] = self.last_block_num_tokens
+            state["token_ids"] = [self.last_token]
+        return state
 
     def __setstate__(self, state):
-        (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.num_cached_tokens,
-            self.block_table,
-            last_token_or_ids
-        ) = state
-        # Check if this is prefill (num_completion_tokens == 0) or decode phase
-        num_completion_tokens = self.num_tokens - self.num_prompt_tokens
-        if num_completion_tokens == 0:
-            # Prefill: last_token_or_ids is the full token_ids list
-            self.token_ids = last_token_or_ids
-        else:
-            # Decode: last_token_or_ids is just the last token
-            self.token_ids = [last_token_or_ids]
-        # Restore last_token attribute
-        self.last_token = self.token_ids[-1] if self.token_ids else None
+        self.__dict__.update(state)
