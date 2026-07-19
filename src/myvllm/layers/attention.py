@@ -112,10 +112,17 @@ def store_kvcache(
 def flash_attention_varlen_kernel(
     Q, K, V, O,
     cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    block_tables_ptr,
     scale,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_num_blocks: tl.constexpr,
+    USE_PAGED_KV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -134,10 +141,16 @@ def flash_attention_varlen_kernel(
     # Load sequence boundaries
     seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
     seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
-    seq_len = seq_end - seq_start
+    seq_len_q = seq_end - seq_start
+    seq_start_k = tl.load(cu_seqlens_k_ptr + seq_idx)
+    seq_end_k = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
+    seq_len_k = seq_end_k - seq_start_k
+    # Prefix-cache hits remove full prefix blocks from Q, while K/V still
+    # represent the full sequence through the paged KV cache.
+    num_cached_tokens = seq_len_k - seq_len_q
     
     # Early exit if this block is beyond sequence length
-    if start_m * BLOCK_M >= seq_len:
+    if start_m * BLOCK_M >= seq_len_q:
         return
     
     # Offset for this block of queries
@@ -148,7 +161,7 @@ def flash_attention_varlen_kernel(
     q_ptrs = Q + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
     
     # Load Q block - shape (BLOCK_M, head_dim)
-    mask_m = offs_m < seq_len
+    mask_m = offs_m < seq_len_q
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
     
     # Initialize output accumulators
@@ -157,7 +170,7 @@ def flash_attention_varlen_kernel(
     acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
     
     # Number of blocks to process
-    num_blocks = tl.cdiv(seq_len, BLOCK_N)
+    num_blocks = tl.cdiv(seq_len_k, BLOCK_N)
     
     # Loop over K, V blocks
     for block_n in range(num_blocks):
@@ -165,10 +178,31 @@ def flash_attention_varlen_kernel(
         offs_n = start_n + tl.arange(0, BLOCK_N)
         
         # Mask for valid positions
-        mask_n = offs_n < seq_len
+        mask_n = offs_n < seq_len_k
         
-        # K pointers: K has shape (total_tokens, num_kv_heads, head_dim)
-        k_ptrs = K + (seq_start + offs_n[None, :]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[:, None]
+        if USE_PAGED_KV:
+            # Prefix hit: current K/V were stored into the paged cache before
+            # this kernel launch, so both the cached prefix and new suffix can
+            # be read through the request's block table.
+            logical_block_idx = offs_n // block_size
+            block_offset = offs_n % block_size
+            block_ids = tl.load(
+                block_tables_ptr
+                + seq_idx * max_num_blocks
+                + logical_block_idx,
+                mask=mask_n,
+                other=0,
+            )
+            cache_offsets = (
+                block_ids * block_size * num_kv_heads * head_dim
+                + block_offset * num_kv_heads * head_dim
+                + kv_head_idx * head_dim
+            )
+            k_ptrs = k_cache_ptr + cache_offsets[None, :] + offs_d[:, None]
+        else:
+            # No prefix hit: K is contiguous and has the same sequence layout
+            # as Q.
+            k_ptrs = K + (seq_start + offs_n[None, :]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[:, None]
         
         # Load K block - shape (head_dim, BLOCK_N)
         k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
@@ -178,7 +212,9 @@ def flash_attention_varlen_kernel(
         qk = qk * scale
         
         # Apply causal mask: only attend to positions <= current position
-        mask_causal = (offs_m[:, None] + seq_start) >= (offs_n[None, :] + seq_start)
+        # offs_m is relative to the uncached suffix, while offs_n is relative
+        # to the full context. Convert Q positions to full-context positions.
+        mask_causal = (num_cached_tokens + offs_m[:, None]) >= offs_n[None, :]
         qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
         
         # Online softmax update
@@ -191,7 +227,10 @@ def flash_attention_varlen_kernel(
         acc = acc * alpha[:, None]
         
         # Load V block - shape (BLOCK_N, head_dim)
-        v_ptrs = V + (seq_start + offs_n[:, None]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[None, :]
+        if USE_PAGED_KV:
+            v_ptrs = v_cache_ptr + cache_offsets[:, None] + offs_d[None, :]
+        else:
+            v_ptrs = V + (seq_start + offs_n[:, None]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[None, :]
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
         
         # Accumulate weighted values
@@ -213,7 +252,12 @@ def flash_attention_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor | None,
+    block_size: int,
     scale: float,
     num_heads: int,
     num_kv_heads: int,
@@ -226,7 +270,8 @@ def flash_attention_prefill(
         q: (total_tokens, num_heads, head_dim)
         k: (total_tokens, num_kv_heads, head_dim)
         v: (total_tokens, num_kv_heads, head_dim)
-        cu_seqlens: cumulative sequence lengths
+        cu_seqlens_q: cumulative lengths of newly computed query tokens
+        cu_seqlens_k: cumulative lengths of the full KV context
         scale: attention scale factor
     
     Returns:
@@ -257,22 +302,37 @@ def flash_attention_prefill(
         BLOCK_N = 16
     
     # Number of sequences
-    num_seqs = cu_seqlens.shape[0] - 1
+    num_seqs = cu_seqlens_q.shape[0] - 1
     
     # Find max sequence length to determine grid size
-    cu_seqlens_cpu = cu_seqlens.cpu()
+    cu_seqlens_cpu = cu_seqlens_q.cpu()
     max_seq_len = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
     
     # Calculate grid dimensions - launch all kernels at once
     grid = (triton.cdiv(max_seq_len, BLOCK_M), num_heads, num_seqs)
     
+    use_paged_kv = block_tables is not None
+    # Triton still requires pointer arguments for constexpr-disabled branches.
+    # These placeholders are never dereferenced when USE_PAGED_KV is False.
+    block_tables_ptr = block_tables if use_paged_kv else cu_seqlens_q
+    k_cache_ptr = k_cache if use_paged_kv else k
+    v_cache_ptr = v_cache if use_paged_kv else v
+    max_num_blocks = block_tables.shape[1] if use_paged_kv else 1
+
     flash_attention_varlen_kernel[grid](
         q, k, v, output,
-        cu_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        k_cache_ptr,
+        v_cache_ptr,
+        block_tables_ptr,
         scale,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        block_size=block_size,
+        max_num_blocks=max_num_blocks,
+        USE_PAGED_KV=use_paged_kv,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
     )
@@ -511,12 +571,26 @@ class Attention(nn.Module):
         if context.is_prefill:
             # Prefill: use flash attention
             # Varlen mode: (total_tokens, num_heads, head_dim)
-            cu_seqlens = context.cu_seqlens_q
-            if cu_seqlens is None:
+            cu_seqlens_q = context.cu_seqlens_q
+            cu_seqlens_k = context.cu_seqlens_k
+            if cu_seqlens_q is None or cu_seqlens_k is None:
                 raise ValueError("cu_seqlens_q must be provided for varlen attention")
             
-            o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
-                                        self.num_heads, self.num_kv_heads, self.head_dim)
+            o = flash_attention_prefill(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                k_cache,
+                v_cache,
+                context.block_tables,
+                self.block_size,
+                scale,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:

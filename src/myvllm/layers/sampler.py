@@ -13,7 +13,9 @@ class SamplerLayer(nn.Module):
 
     @torch.compile
     def forward(self, logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
-        logits/= temperature.unsqueeze(-1)
+        # Sampling probabilities should be computed in FP32 even when model
+        # weights and logits use BF16/FP16.
+        logits = logits.float() / temperature.float().unsqueeze(-1)
         probs = torch.softmax(logits, dim=-1)
         sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
         return sample_tokens

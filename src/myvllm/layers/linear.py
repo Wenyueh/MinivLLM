@@ -159,6 +159,10 @@ class QKVColumnParallelLinear(ColumnParallelLinear):
     ):
         self.tp_size = dist.get_world_size()
         num_kv_heads = num_kv_heads or num_heads
+        if num_heads % self.tp_size != 0:
+            raise ValueError("num_heads must be divisible by tensor parallel size")
+        if num_kv_heads % self.tp_size != 0:
+            raise ValueError("num_kv_heads must be divisible by tensor parallel size")
         self.head_size = head_size
         self.num_heads = num_heads // self.tp_size
         self.num_kv_heads = num_kv_heads // self.tp_size

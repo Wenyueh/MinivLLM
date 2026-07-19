@@ -23,8 +23,27 @@ class ModelRunner:
         self.enforce_eager = config.get('enforce_eager', False)
 
         self.rank = rank
-        dist.init_process_group('nccl', "tcp://localhost:12345", world_size=config['world_size'], rank=rank)
+        dist.init_process_group(
+            'nccl',
+            config.get('distributed_init_method', "tcp://127.0.0.1:12345"),
+            world_size=config['world_size'],
+            rank=rank,
+        )
         torch.cuda.set_device(rank)
+
+        dtype_config = config.get('dtype', 'bfloat16')
+        if isinstance(dtype_config, str):
+            dtype_name = dtype_config.removeprefix('torch.')
+            dtype_mapping = {
+                'float16': torch.float16,
+                'bfloat16': torch.bfloat16,
+                'float32': torch.float32,
+            }
+            if dtype_name not in dtype_mapping:
+                raise ValueError(f"Unsupported dtype: {dtype_config}")
+            self.default_dtype = dtype_mapping[dtype_name]
+        else:
+            self.default_dtype = dtype_config
 
         # set model
         path_str = self.config['model_name_or_path']
@@ -69,7 +88,7 @@ class ModelRunner:
                 raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
         # Load weights in GPU (model moved to GPU before loading weights)
-        self.model = self.model.cuda(rank)
+        self.model = self.model.to(device=f'cuda:{rank}', dtype=self.default_dtype)
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
@@ -80,9 +99,6 @@ class ModelRunner:
         # self.model = self.model.cuda(rank)
 
         self.sampler = SamplerLayer()
-
-        # Store default dtype before it's needed in allocate_kv_cache
-        self.default_dtype = torch.get_default_dtype()
 
         # Debug flag for first decode step
         self._first_decode = False
@@ -104,20 +120,25 @@ class ModelRunner:
             # Synchronize before setting up shared memory
             dist.barrier()
             if self.rank == 0:
-                # Try to clean up existing shared memory first
-                try:
-                    old_shm = SharedMemory(name='myvllm')
-                    old_shm.close()
-                    old_shm.unlink()
-                except FileNotFoundError:
-                    pass  # Doesn't exist, which is fine
-                self.shm = SharedMemory(name='myvllm', create=True, size=2**20)
+                self.shm_size = config.get(
+                    'shared_memory_size',
+                    max(
+                        2**20,
+                        config['max_num_batched_tokens'] * 16
+                        + config['max_num_sequences'] * 4096,
+                    ),
+                )
+                self.shm = SharedMemory(
+                    name=config['shared_memory_name'],
+                    create=True,
+                    size=self.shm_size,
+                )
                 # Barrier to ensure rank 1 waits until shared memory is created
                 dist.barrier()
             else:
                 # Wait for rank 0 to create shared memory
                 dist.barrier()
-                self.shm = SharedMemory(name='myvllm')
+                self.shm = SharedMemory(name=config['shared_memory_name'])
                 # Don't call self.loop() here - let the spawning code handle it
                 # Otherwise we'll be stuck in an infinite loop during __init__
 
@@ -126,6 +147,8 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank != 0, "read_shm can only be called when world_size > 1 and rank != 0"
         self.event.wait()
         n = int.from_bytes(self.shm.buf[:4], 'little') # read length
+        if n <= 0 or n + 4 > len(self.shm.buf):
+            raise RuntimeError(f"Invalid shared-memory message size: {n}")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
         return method_name, args
@@ -137,6 +160,11 @@ class ModelRunner:
         # Flatten: (method_name, args) where args is a tuple -> (method_name, *args)
         data = pickle.dumps((method_name, *args))
         n = len(data)
+        if n + 4 > len(self.shm.buf):
+            raise ValueError(
+                f"Serialized request batch requires {n + 4} bytes, but "
+                f"shared memory has {len(self.shm.buf)} bytes"
+            )
         self.shm.buf[:4] = n.to_bytes(4, 'little')
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -165,7 +193,6 @@ class ModelRunner:
             method_name, args = self.read_shm()
             self.call(method_name, *args) # Unpack args when calling
             if method_name == 'exit':
-                self.exit()
                 break
 
     # will be called by both rank == 0 and rank != 0
@@ -186,10 +213,11 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_tokens = self.config['max_num_batch_tokens']
+        max_tokens = self.config['max_num_batched_tokens']
         max_model_length = self.config['max_model_length']
-        batch_size = max_tokens // max_model_length
-        seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
+        warmup_length = min(max_tokens, max_model_length)
+        batch_size = max(1, max_tokens // warmup_length)
+        seqs = [Sequence(token_ids=[0] * warmup_length, block_size=self.config['block_size']) for _ in range(batch_size)]
         self.run(seqs, is_prefill=True)
         torch.cuda.empty_cache()
 
@@ -244,7 +272,16 @@ class ModelRunner:
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(
+            2,
+            self.config['num_layers'],
+            self.config['max_cached_blocks'],
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+            device=f'cuda:{self.rank}',
+            dtype=self.default_dtype,
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
@@ -343,7 +380,7 @@ class ModelRunner:
         return input_ids    
 
     # prepare the temperature
-    def prepare_sample(self, seqs: list[Sequence]) -> None:
+    def prepare_sample(self, seqs: list[Sequence]) -> torch.Tensor:
         return torch.tensor([seq.temperature for seq in seqs], dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
 
     # when prefilling, directly compute model forward + logits
@@ -383,7 +420,7 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor | None:
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
@@ -404,7 +441,7 @@ class ModelRunner:
     # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
-        max_bs = self.config['max_num_seqs']
+        max_bs = self.config['max_num_sequences']
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len / self.block_size)
         # for decoding, input is always of shape (batch_size, 1)
@@ -417,10 +454,18 @@ class ModelRunner:
         # where to read KV values in the cache
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
         # output logits
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        outputs = torch.zeros(
+            max_bs,
+            self.config['hidden_size'],
+            device=f'cuda:{self.rank}',
+            dtype=self.default_dtype,
+        )
 
         # graphs to be captured for different batch sizes
-        batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        batch_sizes = sorted({
+            bs for bs in [1, 2, 4, 8, max_bs, *range(16, max_bs + 1, 16)]
+            if bs <= max_bs
+        })
         self.graphs = {}
         graph_pool = None
 
@@ -440,8 +485,8 @@ class ModelRunner:
 
             with torch.cuda.graph(graph, graph_pool):
                 outputs[:batch_size] = self.model(input_ids[:batch_size])
-                if graph_pool is None:
-                    graph_pool = graph.pool()
+            if graph_pool is None:
+                graph_pool = graph.pool()
             # store the captured graph
             self.graphs[batch_size] = graph
 

@@ -156,7 +156,7 @@ class LlamaDecoderLayer(nn.Module):
     ):
         super().__init__()
         gamma = torch.ones(hidden_size)
-        self.input_layernorm = LayerNorm(gamma)
+        self.input_layernorm = LayerNorm(gamma, eps=rms_norm_epsilon)
         self.self_attn = LlamaAttn(
             hidden_size=hidden_size,
             head_dim=head_dim,
@@ -168,7 +168,7 @@ class LlamaDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             block_size=block_size,
         )
-        self.post_attention_layernorm = LayerNorm(gamma)
+        self.post_attention_layernorm = LayerNorm(gamma, eps=rms_norm_epsilon)
         self.mlp = LlamaMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -252,7 +252,7 @@ class LlamaModel(nn.Module):
             ) for _ in range(num_layers)
         ])
         gamma = torch.ones(hidden_size)
-        self.norm = LayerNorm(gamma)
+        self.norm = LayerNorm(gamma, eps=rms_norm_epsilon)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)

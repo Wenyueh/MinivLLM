@@ -7,6 +7,7 @@ from collections import deque
 from unittest.mock import MagicMock
 from myvllm.engine.scheduler import Scheduler
 from myvllm.engine.sequence import Sequence, SequenceStatus
+from myvllm.sampling_parameters import SamplingParams
 
 
 def make_scheduler(
@@ -14,6 +15,7 @@ def make_scheduler(
     max_num_sequences=10,
     max_cached_blocks=100,
     block_size=4,
+    max_model_length=100,
 ):
     return Scheduler(
         max_num_sequences=max_num_sequences,
@@ -21,6 +23,7 @@ def make_scheduler(
         max_cached_blocks=max_cached_blocks,
         block_size=block_size,
         eos=0,
+        max_model_length=max_model_length,
     )
 
 
@@ -46,9 +49,9 @@ class TestBug2TokenLimitBreak:
     """
 
     def _run(self, scheduler: Scheduler):
-        seq_a = Sequence([1, 2, 3])
-        seq_b = Sequence([4, 5, 6])
-        seq_c = Sequence([7, 8, 9])
+        seq_a = Sequence([1, 2, 3], block_size=4)
+        seq_b = Sequence([4, 5, 6], block_size=4)
+        seq_c = Sequence([7, 8, 9], block_size=4)
         inject_running(scheduler, seq_a, seq_b, seq_c)
 
         scheduler.block_manager = MagicMock()
@@ -108,8 +111,8 @@ class TestBug1CanAppendFailure:
     """
 
     def _run(self, scheduler: Scheduler):
-        seq_a = Sequence([1, 2, 3])
-        seq_b = Sequence([4, 5, 6])
+        seq_a = Sequence([1, 2, 3], block_size=4)
+        seq_b = Sequence([4, 5, 6], block_size=4)
         inject_running(scheduler, seq_a, seq_b)
 
         mock_bm = MagicMock()
@@ -146,7 +149,7 @@ class TestBug1CanAppendFailure:
 class TestSchedulerHappyPath:
     def test_prefill_scheduled_first(self):
         scheduler = make_scheduler(max_num_batched_tokens=100, max_cached_blocks=50)
-        seq = Sequence([1, 2, 3, 4])
+        seq = Sequence([1, 2, 3, 4], block_size=4)
         scheduler.add_sequence(seq)
 
         scheduled, is_prefill = scheduler.schedule()
@@ -156,8 +159,8 @@ class TestSchedulerHappyPath:
 
     def test_all_running_seqs_scheduled_when_budget_allows(self):
         scheduler = make_scheduler(max_num_batched_tokens=10)
-        seq_a = Sequence([1])
-        seq_b = Sequence([2])
+        seq_a = Sequence([1], block_size=4)
+        seq_b = Sequence([2], block_size=4)
         inject_running(scheduler, seq_a, seq_b)
 
         scheduler.block_manager = MagicMock()
@@ -174,7 +177,7 @@ class TestSchedulerHappyPath:
     def test_preempt_only_seq_when_cant_append_and_running_empty(self):
         """Original else-branch: running=[seq], can_append=False → preempt seq → waiting."""
         scheduler = make_scheduler()
-        seq = Sequence([1, 2])
+        seq = Sequence([1, 2], block_size=4)
         inject_running(scheduler, seq)
 
         scheduler.block_manager = MagicMock()
@@ -186,3 +189,111 @@ class TestSchedulerHappyPath:
         assert len(scheduled) == 0
         assert seq in scheduler.waiting
         assert seq.status == SequenceStatus.WAITING
+
+
+class TestContextLength:
+    def test_request_inherits_engine_context_limit(self):
+        scheduler = make_scheduler(max_model_length=16)
+        seq = Sequence([1, 2], block_size=4)
+
+        scheduler.add_sequence(seq)
+
+        assert seq.max_model_length == 16
+
+    def test_request_can_choose_a_smaller_context_limit(self):
+        scheduler = make_scheduler(max_model_length=16)
+        params = SamplingParams(max_model_length=8)
+        seq = Sequence([1, 2], block_size=4, sampling_params=params)
+
+        scheduler.add_sequence(seq)
+
+        assert seq.max_model_length == 8
+
+    def test_rejects_prompt_that_leaves_no_generation_room(self):
+        scheduler = make_scheduler(max_model_length=8)
+        seq = Sequence(list(range(8)), block_size=4)
+
+        with pytest.raises(ValueError, match="Prompt length"):
+            scheduler.add_sequence(seq)
+
+    def test_rejects_request_limit_above_engine_limit(self):
+        scheduler = make_scheduler(max_model_length=8)
+        params = SamplingParams(max_model_length=9)
+        seq = Sequence([1], block_size=4, sampling_params=params)
+
+        with pytest.raises(ValueError, match="exceeds the engine limit"):
+            scheduler.add_sequence(seq)
+
+    def test_engine_limit_must_fit_in_kv_cache(self):
+        with pytest.raises(ValueError, match="exceeds the KV cache capacity"):
+            make_scheduler(
+                max_cached_blocks=2,
+                block_size=4,
+                max_model_length=9,
+            )
+
+    def test_generation_stops_at_request_context_limit(self):
+        scheduler = make_scheduler(max_model_length=8)
+        params = SamplingParams(max_tokens=10, max_model_length=4)
+        seq = Sequence([1, 2, 3], block_size=4, sampling_params=params)
+        seq.status = SequenceStatus.RUNNING
+        seq.block_table = [0]
+        scheduler.block_manager.blocks[0].ref_count = 1
+        scheduler.block_manager.free_block_ids.remove(0)
+        scheduler.block_manager.used_block_ids.add(0)
+        scheduler.running.append(seq)
+
+        scheduler.postprocess([seq], [42])
+
+        assert seq.is_finished
+        assert seq.num_tokens == 4
+        assert seq not in scheduler.running
+
+
+class TestPrefillBudget:
+    def test_rejects_uncached_prompt_larger_than_prefill_budget(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=2,
+            max_model_length=8,
+        )
+        scheduler.add_sequence(Sequence([1, 2, 3], block_size=4))
+
+        with pytest.raises(ValueError, match="chunked prefill"):
+            scheduler.schedule()
+
+    def test_prefix_hit_counts_only_uncached_tokens(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=2,
+            max_cached_blocks=8,
+            block_size=2,
+            max_model_length=8,
+        )
+        cached = Sequence([1, 2, 9], block_size=2)
+        scheduler.block_manager.allocate(cached)
+        scheduler.block_manager.deallocate(cached)
+
+        request = Sequence([1, 2, 3, 4], block_size=2)
+        scheduler.add_sequence(request)
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert scheduled == [request]
+        assert request.num_cached_tokens == 2
+
+
+class TestSchedulingFairness:
+    def test_alternates_prefill_and_decode_when_both_have_work(self):
+        scheduler = make_scheduler(max_num_batched_tokens=100)
+        running = Sequence([1, 2], block_size=4)
+        scheduler.block_manager.allocate(running)
+        inject_running(scheduler, running)
+        waiting = Sequence([3, 4], block_size=4)
+        scheduler.add_sequence(waiting)
+
+        first, first_is_prefill = scheduler.schedule()
+        assert first_is_prefill
+        assert first == [waiting]
+
+        second, second_is_prefill = scheduler.schedule()
+        assert not second_is_prefill
+        assert set(second) == {running, waiting}

@@ -2,6 +2,24 @@ from myvllm.layers import *
 import torch 
 import torch.nn as nn
 
+
+def get_qwen_positions(context, device: torch.device, num_tokens: int) -> torch.Tensor:
+    if context.is_prefill and context.cu_seqlens_q is not None:
+        cu_q = context.cu_seqlens_q
+        cu_k = context.cu_seqlens_k
+        query_lens = cu_q[1:] - cu_q[:-1]
+        cached_lens = (cu_k[1:] - cu_k[:-1]) - query_lens
+        query_starts = torch.repeat_interleave(cu_q[:-1], query_lens)
+        cached_starts = torch.repeat_interleave(cached_lens, query_lens)
+        return (
+            torch.arange(num_tokens, device=device)
+            - query_starts.to(device=device)
+            + cached_starts.to(device=device)
+        ).long()
+    if context.is_prefill:
+        return torch.arange(num_tokens, device=device)
+    return context.context_lens - 1
+
 # Qwen3Attention: 
 # qkv projection
 # if not qkv_bias: then rms_norm
@@ -25,10 +43,16 @@ class Qwen3Attention(nn.Module):
         super().__init__()
         self.tp_size = dist.get_world_size()
 
+        if num_heads % self.tp_size != 0:
+            raise ValueError("num_heads must be divisible by tensor parallel size")
+        total_num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        if total_num_kv_heads % self.tp_size != 0:
+            raise ValueError("num_kv_heads must be divisible by tensor parallel size")
+
         self.total_num_heads = num_heads
         self.num_heads = num_heads // self.tp_size
 
-        self.total_num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.total_num_kv_heads = total_num_kv_heads
         # self.num_kv_heads is per-GPU value (divided by tp_size)
         self.num_kv_heads = self.total_num_kv_heads // self.tp_size
 
@@ -47,8 +71,8 @@ class Qwen3Attention(nn.Module):
         self.qkv_bias = qkv_bias
 
         # Q and K norms as used in Qwen3
-        self.q_norm = LayerNorm(torch.ones(head_dim))
-        self.k_norm = LayerNorm(torch.ones(head_dim))
+        self.q_norm = LayerNorm(torch.ones(head_dim), eps=rms_norm_epsilon)
+        self.k_norm = LayerNorm(torch.ones(head_dim), eps=rms_norm_epsilon)
 
         self.rotary_emb = RotaryEmbedding(
             base=base,
@@ -177,7 +201,7 @@ class Qwen3DecoderLayer(nn.Module):
     ):
         super().__init__()
         gamma = torch.ones(hidden_size)
-        self.input_layernorm = LayerNorm(gamma)
+        self.input_layernorm = LayerNorm(gamma, eps=rms_norm_epsilon)
         self.self_attn = Qwen3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -190,7 +214,7 @@ class Qwen3DecoderLayer(nn.Module):
             max_position=max_position,
             block_size=block_size,
         )
-        self.post_attention_layernorm = LayerNorm(gamma)
+        self.post_attention_layernorm = LayerNorm(gamma, eps=rms_norm_epsilon)
         self.mlp = Qwen3MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -206,20 +230,9 @@ class Qwen3DecoderLayer(nn.Module):
         # Compute positions based on context (respecting sequence boundaries for batched prefill)
         from myvllm.utils import get_context
         context = get_context()
-        if context.is_prefill and context.cu_seqlens_q is not None:
-            # For batched prefill, create positions that restart at 0 for each sequence
-            positions = []
-            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
-            for i in range(len(cu_seqlens) - 1):
-                seq_len = cu_seqlens[i+1] - cu_seqlens[i]
-                positions.extend(range(seq_len))
-            positions = torch.tensor(positions, dtype=torch.long, device=x.device)
-        elif context.is_prefill:
-            # For single sequence prefill, use sequential positions
-            positions = torch.arange(x.size(0), device=x.device)
-        else:
-            # For decode, use context_lens - 1 as positions (current position for each sequence)
-            positions = context.context_lens - 1
+        # Prefix hits remove cached tokens from Q. RoPE positions must still
+        # refer to positions in the full sequence, not restart at zero.
+        positions = get_qwen_positions(context, x.device, x.size(0))
 
         x = self.self_attn(x, positions=positions)
         # Residual connection always on for attention output
@@ -271,7 +284,7 @@ class Qwen3Model(nn.Module):
             ) for _ in range(num_layers)
         ])
         gamma = torch.ones(hidden_size)
-        self.norm = LayerNorm(gamma)
+        self.norm = LayerNorm(gamma, eps=rms_norm_epsilon)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(input_ids)
@@ -286,12 +299,17 @@ class Qwen3Model(nn.Module):
 # Qwen3ForCausalLM
 # add lm_head on top of Qwen3Model
 class Qwen3ForCausalLM(nn.Module):
-    packed_module_mapping = {
-        "q_proj": ('q_proj', 'q'),
-        "k_proj": ('k_proj', 'k'),
-        "v_proj": ('v_proj', 'v'),
-        "gate_up": ('gate_up_proj', '0'),
-        "gate_down": ('gate_down_proj', '1'),
+    # target packed module -> (Hugging Face source module, shard id)
+    packed_modules_mapping = {
+        "qkv_projection": [
+            ("q_proj", "q"),
+            ("k_proj", "k"),
+            ("v_proj", "v"),
+        ],
+        "gate_up": [
+            ("gate_proj", 0),
+            ("up_proj", 1),
+        ],
     }
     def __init__(
         self,

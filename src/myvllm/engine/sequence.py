@@ -14,7 +14,9 @@ class SequenceStatus(Enum):
 class Sequence:
     counter = count()
 
-    def __init__(self, token_ids: list[int], block_size: int, sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], block_size: int, sampling_params=None):
+        if sampling_params is None:
+            sampling_params = SamplingParams()
         self.block_size = block_size # number of tokens per block
         # record sequence id
         self.seq_id = next(Sequence.counter)
@@ -69,8 +71,13 @@ class Sequence:
 
     @property
     def last_block_num_tokens(self):
-        full_blocks = int(math.floor(self.num_tokens / self.block_size))
-        return len(self.token_ids[full_blocks * self.block_size : ])
+        if self.num_tokens == 0:
+            return 0
+        rest_tokens_num = self.num_tokens % self.block_size
+        if rest_tokens_num == 0:
+            return self.block_size
+        else:
+            return rest_tokens_num
 
     def block(self, i):
         assert 0 <= i < self.num_blocks, f"Block index {i} out of range [0, {self.num_blocks})"
@@ -88,6 +95,7 @@ class Sequence:
 
     def __getstate__(self):
         return (
+            self.block_size,
             self.num_tokens, 
             self.num_prompt_tokens, 
             self.num_cached_tokens, 
@@ -97,6 +105,7 @@ class Sequence:
 
     def __setstate__(self, state):
         (
+            self.block_size,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,

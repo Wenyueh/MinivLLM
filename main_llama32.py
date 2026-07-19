@@ -16,7 +16,7 @@ config = {
     'max_num_batched_tokens': 1024,
     'max_cached_blocks': 1024,
 
-    'max_num_batch_tokens': 4096,
+    'dtype': 'bfloat16',
     'max_model_length': 128,
     'gpu_memory_utilization': 0.9,
 
