@@ -147,6 +147,20 @@ for name, param in model.named_parameters():
    - Each GPU stores complete heads (don't shard head_size)
    - Enables independent attention computation per GPU
 
+**Benchmark Results:**
+Use the following command to enter the `src/myvllm/layers` directory, and verify whether the execution results are correct in a distributed environment.
+```
+cd src/myvllm/layers
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --nproc_per_node=4 linear.py
+```
+If the output shows `allclose=True`, it indicates that the multi-machine parallel results are consistent with the single-machine results.
+```
+[ColumnParallel] allclose=True, max_abs_err=0.000107
+[MergedColumnParallel] allclose=True, max_abs_err=0.000103
+[QKVColumnParallel] allclose=True, max_abs_err=0.000061
+[RowParallel] allclose=True, max_abs_err=0.000011
+```
+
 **MLP Layer Pattern:**
 - One ColumnParallel → One RowParallel → `dist.all_reduce`
 - Output sharding of first layer = Input sharding of second layer
@@ -185,11 +199,10 @@ y = x.reshape(2, 3).T  # logically: [[1,4],[2,5],[3,6]]
 
 ---
 
-### 1.5 Attention Layer
+### 1.5 Attention Layer ✅
 
 Path: [attention.py](src/myvllm/layers/attention.py)
-
-Implement attention mechanism (preferably FlashAttention).
+Benchmark: [benchmark_decoding.py](benchmark_decoding.py)
 
 **Key Tensor Concepts:**
 - **stride()**: When a tensor is stored in memory, it's a contiguous 1D array. Stride tells you how many elements to skip to move to the next element along a dimension.
@@ -207,6 +220,182 @@ Implement attention mechanism (preferably FlashAttention).
 
 **Triton Kernel Note:**
 - When passing PyTorch tensor to Triton kernel, **Triton automatically extracts the pointer** (memory address) from the tensor
+
+---
+
+#### FlashAttention vs PagedAttention
+
+These are not two alternatives — they are **orthogonal**, and the decode kernel uses both:
+
+- **FlashAttention** is a *compute* technique: tile the sequence and merge each tile with an online softmax, so the `(seq_len, seq_len)` score matrix is never materialized. It solves memory traffic.
+- **PagedAttention** is a *storage* technique: keep the KV cache in fixed-size blocks and reach them through a per-sequence block table. It solves fragmentation.
+
+|  | Prefill | Decode |
+|---|---|---|
+| Query length | whole prompt (100s–1000s of tokens) | exactly **1** token per sequence |
+| Compute | tiled + online softmax (**flash**) | tiled + online softmax (**flash**) |
+| K/V source | the `k`, `v` just computed, packed varlen | the **paged** KV cache |
+| Bottleneck | compute (large matmuls) | memory (walk the whole cache for one token) |
+| Kernel | `flash_attention_prefill` | `paged_attention_decode` |
+
+So decode is *flash **and** paged*; in this repo prefill is flash only, because it reads K/V straight from the tensors it was handed instead of from the cache.
+
+Decode is where an inference engine spends most of its wall clock, so the rest of this section walks through the paged decode kernel step by step.
+
+---
+
+#### Step 1: Fix the KV cache layout
+
+```python
+k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
+```
+
+The cache is a flat pool of fixed-size **blocks**. A sequence does not own a contiguous span of it — it owns a *list* of blocks that the `BlockManager` hands out from whatever is free. `block_size` is 256 in [main.py](main.py).
+
+Flattened, the element offset of one (block, slot, kv_head, dim) entry is:
+
+```python
+offset = (physical_block * block_size * num_kv_heads * head_dim   # skip whole blocks
+          + slot          * num_kv_heads * head_dim               # skip slots in this block
+          + kv_head       * head_dim                              # skip heads
+          + dim)
+```
+
+Keep this formula in mind — every bug in Step 7 is a wrong term in it.
+
+#### Step 2: Write new K/V into the cache
+
+`store_kvcache` launches a `(num_tokens, num_kv_heads)` grid. Each program copies one token's K and V for one head into the slot given by `slot_mapping[token]`, which the ModelRunner precomputes. A `slot_mapping` of `-1` means "skip this token".
+
+#### Step 3: Prefill — variable-length attention
+
+Sequences in a batch have different lengths, so they are packed end to end and delimited by `cu_seqlens` (cumulative lengths):
+
+```
+cu_seqlens = [0, 5, 12, 20]   ->   seq 0 = tokens 0..4, seq 1 = 5..11, seq 2 = 12..19
+```
+
+Grid is `(cdiv(max_seq_len, BLOCK_M), num_heads, num_seqs)`: one program per query block, per head, per sequence. Each program holds its Q block in registers and streams K/V blocks past it, updating the running softmax.
+
+#### Step 4: The online softmax recurrence
+
+Both kernels rely on it. Attention over a chunk `j` can be merged into a running result without ever holding all scores:
+
+```python
+m_new = max(m_old, max(qk_j))          # running max, for numerical stability
+alpha = exp(m_old - m_new)             # how much to shrink what we already had
+acc   = acc * alpha + sum(exp(qk_j - m_new) * V_j)
+l     = l   * alpha + sum(exp(qk_j - m_new))
+# after the last chunk:
+out   = acc / l
+```
+
+`m` exists only to stop `exp()` from overflowing; `l` is the softmax denominator accumulated so far.
+
+#### Step 5: Decode — walking the paged cache
+
+Grid is `(batch_size, num_heads)`: one program per (sequence, query head). Each program loads its single query vector, then walks that sequence's KV cache in chunks of `BLOCK_N` tokens, applying the recurrence above.
+
+The hard part is that a chunk of *logical* tokens is scattered across *physical* blocks. Resolving one logical token takes **two divisions**:
+
+```python
+logical_block  = t // block_size                       # which block of this sequence
+slot           = t %  block_size                       # where inside that block
+physical_block = block_tables[seq, logical_block]      # the indirection
+```
+
+For GQA, the query head also has to be mapped to its KV head:
+
+```python
+kv_head_idx = head_idx // (num_heads // num_kv_heads)
+```
+
+#### Step 6: How to walk a chunk
+
+Three ways to fill in `physical_block` and `slot` for a chunk of `BLOCK_N` tokens:
+
+**(a) One token at a time** — correct but slow. `for i in range(BLOCK_N)` unrolls into `BLOCK_N` scalar loads plus `BLOCK_N` `tl.where` merges, leaving the whole SIMD width idle.
+
+**(b) One block-table lookup per chunk** — fast, but only valid when a chunk cannot straddle two blocks (`block_size % BLOCK_N == 0`), and it still needs `slot = t % block_size`.
+
+**(c) Gather the block table per token** — fast *and* general. Each lane resolves its own token, so a chunk may span any number of blocks:
+
+```python
+offs_n        = token_start + tl.arange(0, BLOCK_N)
+logical_block = offs_n // block_size
+offs_in_block = offs_n %  block_size
+
+in_range = (offs_n < context_len) & (logical_block < max_num_blocks)
+
+# one block-table entry per token, not per chunk
+physical_block = tl.load(block_tables_ptr + batch_idx * max_num_blocks + logical_block,
+                         mask=in_range, other=-1)
+valid = in_range & (physical_block != -1)
+
+# masked lanes still take part in address arithmetic: give them block 0
+physical_block = tl.where(valid, physical_block, 0).to(tl.int64)
+
+kv_offset = (physical_block[None, :] * (block_size * num_kv_heads * head_dim)
+             + offs_in_block[None, :] * (num_kv_heads * head_dim)
+             + kv_head_idx * head_dim
+             + offs_d[:, None])
+```
+
+K and V share `kv_offset`, so the block table is gathered once per chunk instead of twice.
+
+#### Step 7: Pitfalls
+
+1. **Global token index used as the within-block offset.** `physical_block * block_size` already moves the pointer to the start of the block, so the next term must be `t % block_size`, not `t`. Using `t` reads past the block into whatever sequence owns the following blocks — and far enough past the end of the cache it becomes an illegal memory access. It looks correct as long as every test sequence fits in a single block.
+2. **One block-table lookup per chunk.** Only valid if a chunk fits inside a block. With `block_size=16` and `BLOCK_N=64` a chunk spans 4 blocks and 3 of them are never looked up.
+3. **Masked lanes still compute addresses.** `tl.load(..., mask=...)` suppresses the *load*, not the address arithmetic. A `-1` left in `physical_block` produces a negative offset, so clamp invalid lanes to block 0.
+4. **int32 overflow.** At 256×8×128 = 262144 elements per block, `physical_block * block_size * num_kv_heads * head_dim` overflows int32 past ~8192 blocks. Cast the block index to `int64`.
+5. **Identity block tables in tests.** If a test builds `block_tables = torch.arange(...)`, logical order equals physical order and *every* bug above disappears. Use a shuffled mapping — that is what a real `BlockManager` produces.
+6. **Losing the bounds check.** `logical_block < max_num_blocks` guards against reading past the end of the block table.
+
+---
+
+#### Benchmark results
+
+[benchmark_decoding.py](benchmark_decoding.py) compares four implementations on identical inputs. Every one is checked against a float32 reference *before* it is timed — a kernel that is fast because it reads the wrong memory shows up as `NO` in the correct column rather than as a speedup.
+
+Qwen3-0.6B attention shape (`num_heads=16, num_kv_heads=8, head_dim=128, block_size=256`), fp16, one A6000. Time per call in ms, speedup relative to Naive PyTorch:
+
+| batch | seq_len | Naive PyTorch | Fast PyTorch | Triton per-token | Triton chunked |
+|------:|--------:|--------------:|-------------:|-----------------:|---------------:|
+| 1 | 128 | 0.385 (1.0x) | 0.778 (0.5x) | 0.088 (4.4x) | **0.028 (14.0x)** |
+| 1 | 512 | 0.445 (1.0x) | 0.977 (0.5x) | 0.340 (1.3x) | **0.026 (16.8x)** |
+| 1 | 2048 | 0.735 (1.0x) | 0.818 (0.9x) | 1.939 (0.4x) | **0.098 (7.5x)** |
+| 8 | 128 | 0.833 (1.0x) | 3.780 (0.2x) | 0.084 (10.0x) | **0.026 (31.8x)** |
+| 8 | 512 | 1.232 (1.0x) | 4.029 (0.3x) | 0.465 (2.7x) | **0.040 (31.1x)** |
+| 8 | 2048 | 4.297 (1.0x) | 5.042 (0.9x) | 1.848 (2.3x) | **0.127 (33.9x)** |
+| 32 | 128 | 2.272 (1.0x) | 14.410 (0.2x) | 0.127 (17.9x) | **0.034 (67.5x)** |
+| 32 | 512 | 4.574 (1.0x) | 15.147 (0.3x) | 0.518 (8.8x) | **0.130 (35.1x)** |
+| 32 | 2048 | 16.849 (1.0x) | 19.681 (0.9x) | 1.975 (8.5x) | **0.493 (34.2x)** |
+
+Reading the table:
+
+- **Chunked beats per-token by 3.1x–21.3x**, and the gap widens with context length. At `seq_len=2048` the per-token kernel is *slower than PyTorch*: its cost tracks token count rather than memory traffic.
+- **"Fast PyTorch" is usually the slowest.** Its vectorised gather materializes a dense `(batch, max_ctx, kv_heads, head_dim)` copy of the cache, and at batch 32 that allocation dominates. Padding to a dense tensor is exactly what paged attention exists to avoid.
+- **The Triton kernels win most at large batch**, where the `(batch, num_heads)` grid finally has enough programs to fill the GPU.
+- **Batch 1 is the weak spot**: only 16 programs, so most of the GPU sits idle. Splitting the KV sequence across programs (flash-decoding) is the next optimization — the grid becomes `(batch, heads, kv_splits)` and a second kernel merges each split's `(m, l, acc)`.
+
+The generic per-token gather costs nothing measurable over the block-aligned version — the kernel is memory-bound — and it works for any `block_size`:
+
+| block_size | Triton per-token | Triton chunked | speedup |
+|-----------:|-----------------:|---------------:|--------:|
+| 16 | 0.978 ms | 0.056 ms | 17.5x |
+| 32 | 0.979 ms | 0.056 ms | 17.5x |
+| 100 | 1.014 ms | 0.057 ms | 17.8x |
+| 256 | 0.955 ms | 0.053 ms | 18.0x |
+
+(batch 4, seq_len 1000. `block_size=100` is deliberately neither a power of two nor a multiple of `BLOCK_N`.)
+
+Running it:
+
+```bash
+uv run python benchmark_decoding.py                                  # default sweep
+uv run python benchmark_decoding.py --block-size 16 --seq-lens 1000  # single config
+```
 
 ---
 

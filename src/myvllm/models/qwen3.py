@@ -110,10 +110,7 @@ class Qwen3Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # DEBUG: Print positions to diagnose issue
-        import sys
-
-        q, k = self.rotary_emb(positions, q, k) 
+        q, k = self.rotary_emb(positions, q, k)
 
         o = self.attention(q, k, v)
         # o shape: (B*N, num_heads, head_dim)     - Per-GPU, different heads per GPU

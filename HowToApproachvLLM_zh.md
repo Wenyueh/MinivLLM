@@ -148,9 +148,24 @@ for name, param in model.named_parameters():
     - 每张 GPU 存完整的 heads（不对 `head_size` 维度做切分）
     - 使每张 GPU 可以独立完成注意力计算
 
+**基准测试：**
+使用如下指令，进入`src/myvllm/layers`目录，在分布式环境测试运行结果是否正确
+```
+cd src/myvllm/layers
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --nproc_per_node=4 linear.py
+```
+输出结果`allclose=True`则代表多机并行结果与单机一致
+```
+[ColumnParallel] allclose=True, max_abs_err=0.000107
+[MergedColumnParallel] allclose=True, max_abs_err=0.000103
+[QKVColumnParallel] allclose=True, max_abs_err=0.000061
+[RowParallel] allclose=True, max_abs_err=0.000011
+```
 **MLP 层的常见模式:**
     - 一个 `ColumnParallel` → 一个 RowParallel → `dist.all_reduce`
     - 第一层的输出切分方式 = 第二层的输入切分方式
+
+
 
 ---
 
@@ -186,11 +201,10 @@ y = x.reshape(2, 3).T   # 逻辑视图: [[1,4],[2,5],[3,6]]
 
 ---
 
-### 1.5 注意力层（Attention Layer）
+### 1.5 注意力层（Attention Layer）✅
 
 具体实现：[attention.py](src/myvllm/layers/attention.py)
-
-实现注意力机制（最好使用 FlashAttention）。
+性能测试：[benchmark_decoding.py](benchmark_decoding.py)
 
 **关键张量概念（Key Tensor Concepts）：**
 - **`stride()`**：当一个张量存储在内存中时，本质上是一个连续的一维数组。stride 用来描述：沿着某个维度移动到“下一个元素”时，需要在底层内存中跳过多少个元素。
@@ -208,6 +222,182 @@ y = x.reshape(2, 3).T   # 逻辑视图: [[1,4],[2,5],[3,6]]
 
 **Triton Kernel 备注：**
 - 当将 PyTorch 张量传给 Triton kernel 时，**Triton 会自动从张量中提取指针**（内存地址）
+
+---
+
+#### FlashAttention 与 PagedAttention
+
+这两者不是二选一的关系，而是**正交的两个维度**，decode kernel 两者都用：
+
+- **FlashAttention** 是**计算**技术：把序列分块，用 online softmax 逐块合并，从而不需要 materialize `(seq_len, seq_len)` 的分数矩阵。解决的是访存开销。
+- **PagedAttention** 是**存储**技术：KV cache 按固定大小的块存放，通过每个序列各自的 block table 间接寻址。解决的是显存碎片化。
+
+|  | Prefill | Decode |
+|---|---|---|
+| Query 长度 | 整个 prompt（数百到数千 token） | 每个序列恰好 **1** 个 token |
+| 计算方式 | 分块 + online softmax（**flash**） | 分块 + online softmax（**flash**） |
+| K/V 来源 | 刚算出的 `k`、`v`，varlen 打包 | **paged** KV cache |
+| 瓶颈 | 计算（大矩阵乘） | 访存（为产出 1 个 token 要遍历整个 cache） |
+| Kernel | `flash_attention_prefill` | `paged_attention_decode` |
+
+所以 decode 是 *flash **加** paged*；本仓库的 prefill 只用了 flash，因为它直接读传进来的张量，不读 cache。
+
+推理引擎的绝大部分时间花在 decode 上，因此本节剩余部分逐步讲解 paged decode kernel。
+
+---
+
+#### Step 1：确定 KV cache 的内存布局
+
+```python
+k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
+```
+
+cache 是一个由固定大小**块（block）**组成的扁平池。一个序列并不占据其中连续的一段，而是持有一个**块列表** —— `BlockManager` 从空闲块里任意分配。[main.py](main.py) 中 `block_size` 为 256。
+
+展平之后，某个 (block, slot, kv_head, dim) 元素的偏移量为：
+
+```python
+offset = (physical_block * block_size * num_kv_heads * head_dim   # 跳过前面整块
+          + slot          * num_kv_heads * head_dim               # 跳过块内前面的槽位
+          + kv_head       * head_dim                              # 跳过前面的头
+          + dim)
+```
+
+记住这个公式 —— Step 7 里的每个 bug 都是这个公式中某一项写错了。
+
+#### Step 2：把新的 K/V 写入 cache
+
+`store_kvcache` 启动 `(num_tokens, num_kv_heads)` 的 grid。每个 program 把一个 token 在一个头上的 K 和 V 拷贝到 `slot_mapping[token]` 指定的槽位，该映射由 ModelRunner 预先算好。`slot_mapping` 为 `-1` 表示跳过该 token。
+
+#### Step 3：Prefill —— 变长注意力
+
+同一批次内的序列长度不同，因此它们被首尾拼接，用 `cu_seqlens`（累积长度）划分边界：
+
+```
+cu_seqlens = [0, 5, 12, 20]   ->   seq 0 = tokens 0..4, seq 1 = 5..11, seq 2 = 12..19
+```
+
+grid 为 `(cdiv(max_seq_len, BLOCK_M), num_heads, num_seqs)`：每个 program 负责一个序列、一个头、一个 query 分块。program 把自己的 Q 块常驻寄存器，让 K/V 块流经它，并不断更新 running softmax。
+
+#### Step 4：Online softmax 递推
+
+两个 kernel 都依赖它。第 `j` 块的注意力结果可以合并进已有结果，全程不需要持有所有分数：
+
+```python
+m_new = max(m_old, max(qk_j))          # running max，保证数值稳定
+alpha = exp(m_old - m_new)             # 已累积部分需要缩放的比例
+acc   = acc * alpha + sum(exp(qk_j - m_new) * V_j)
+l     = l   * alpha + sum(exp(qk_j - m_new))
+# 最后一块处理完之后：
+out   = acc / l
+```
+
+`m` 的唯一作用是防止 `exp()` 溢出；`l` 是到目前为止累积的 softmax 分母。
+
+#### Step 5：Decode —— 遍历 paged cache
+
+grid 为 `(batch_size, num_heads)`：每个 program 负责一个（序列，query 头）组合。program 载入它那一个 query 向量，然后以 `BLOCK_N` 个 token 为一块遍历该序列的 KV cache，套用上面的递推。
+
+难点在于：一块**逻辑上**连续的 token，在**物理上**散落在不同的块里。解析一个逻辑 token 需要**两次除法**：
+
+```python
+logical_block  = t // block_size                       # 属于本序列的第几块
+slot           = t %  block_size                       # 在该块内的第几个位置
+physical_block = block_tables[seq, logical_block]      # 间接寻址
+```
+
+对 GQA 而言，还需要把 query 头映射到对应的 KV 头：
+
+```python
+kv_head_idx = head_idx // (num_heads // num_kv_heads)
+```
+
+#### Step 6：如何遍历一个 chunk
+
+为一块 `BLOCK_N` 个 token 填出 `physical_block` 和 `slot`，有三种写法：
+
+**(a) 逐 token 处理** —— 正确但慢。`for i in range(BLOCK_N)` 会展开成 `BLOCK_N` 次标量加载再加 `BLOCK_N` 次 `tl.where` 合并，整个 SIMD 宽度都在闲置。
+
+**(b) 每个 chunk 查一次 block table** —— 快，但仅当一个 chunk 不会跨越两个块时才成立（`block_size % BLOCK_N == 0`），而且仍然需要 `slot = t % block_size`。
+
+**(c) 逐 token gather block table** —— 既快又通用。每条 lane 解析自己的 token，因此一个 chunk 可以跨越任意多个块：
+
+```python
+offs_n        = token_start + tl.arange(0, BLOCK_N)
+logical_block = offs_n // block_size
+offs_in_block = offs_n %  block_size
+
+in_range = (offs_n < context_len) & (logical_block < max_num_blocks)
+
+# 每个 token 一个 block table 条目，而不是每个 chunk 一个
+physical_block = tl.load(block_tables_ptr + batch_idx * max_num_blocks + logical_block,
+                         mask=in_range, other=-1)
+valid = in_range & (physical_block != -1)
+
+# 被 mask 掉的 lane 仍会参与地址运算：把它们指向第 0 块
+physical_block = tl.where(valid, physical_block, 0).to(tl.int64)
+
+kv_offset = (physical_block[None, :] * (block_size * num_kv_heads * head_dim)
+             + offs_in_block[None, :] * (num_kv_heads * head_dim)
+             + kv_head_idx * head_dim
+             + offs_d[:, None])
+```
+
+K 和 V 共用 `kv_offset`，因此每个 chunk 只 gather 一次 block table，而不是两次。
+
+#### Step 7：容易踩的坑
+
+1. **把全局 token 下标当成块内偏移。** `physical_block * block_size` 已经把指针移到了该块的起始位置，所以下一项必须是 `t % block_size` 而不是 `t`。用 `t` 会越过块尾读到后续块所属的其他序列的数据 —— 越界得足够远时会直接变成非法内存访问。只要测试用的序列都能装进单个块，这个错误就看不出来。
+2. **每个 chunk 只查一次 block table。** 只有当 chunk 能装进一个块时才成立。`block_size=16` 配 `BLOCK_N=64` 时，一个 chunk 横跨 4 个块，其中 3 个从未被查过。
+3. **被 mask 掉的 lane 仍然会计算地址。** `tl.load(..., mask=...)` 抑制的是**加载**，不是地址运算。`physical_block` 中残留的 `-1` 会算出负偏移，因此要把无效 lane 钳到第 0 块。
+4. **int32 溢出。** 每块 256×8×128 = 262144 个元素，`physical_block * block_size * num_kv_heads * head_dim` 在块数超过约 8192 时会溢出 int32。需要把块下标转成 `int64`。
+5. **测试里用恒等的 block table。** 如果测试用 `block_tables = torch.arange(...)` 构造，逻辑顺序就等于物理顺序，上面**所有** bug 都会消失。应当使用打乱的映射 —— 真实的 `BlockManager` 产出的就是这样。
+6. **丢掉边界检查。** `logical_block < max_num_blocks` 用于防止读越 block table 的尾部。
+
+---
+
+#### 性能测试结果
+
+[benchmark_decoding.py](benchmark_decoding.py) 在完全相同的输入上对比四种实现。每种实现在计时**之前**都会先和 float32 参考结果比对 —— 一个因为读错内存而“变快”的 kernel，会在 correct 列显示 `NO`，而不是显示成加速。
+
+Qwen3-0.6B 的注意力形状（`num_heads=16, num_kv_heads=8, head_dim=128, block_size=256`），fp16，单张 A6000。单次调用耗时（ms），加速比相对 Naive PyTorch：
+
+| batch | seq_len | Naive PyTorch | Fast PyTorch | Triton 逐 token | Triton 分块 |
+|------:|--------:|--------------:|-------------:|----------------:|------------:|
+| 1 | 128 | 0.385 (1.0x) | 0.778 (0.5x) | 0.088 (4.4x) | **0.028 (14.0x)** |
+| 1 | 512 | 0.445 (1.0x) | 0.977 (0.5x) | 0.340 (1.3x) | **0.026 (16.8x)** |
+| 1 | 2048 | 0.735 (1.0x) | 0.818 (0.9x) | 1.939 (0.4x) | **0.098 (7.5x)** |
+| 8 | 128 | 0.833 (1.0x) | 3.780 (0.2x) | 0.084 (10.0x) | **0.026 (31.8x)** |
+| 8 | 512 | 1.232 (1.0x) | 4.029 (0.3x) | 0.465 (2.7x) | **0.040 (31.1x)** |
+| 8 | 2048 | 4.297 (1.0x) | 5.042 (0.9x) | 1.848 (2.3x) | **0.127 (33.9x)** |
+| 32 | 128 | 2.272 (1.0x) | 14.410 (0.2x) | 0.127 (17.9x) | **0.034 (67.5x)** |
+| 32 | 512 | 4.574 (1.0x) | 15.147 (0.3x) | 0.518 (8.8x) | **0.130 (35.1x)** |
+| 32 | 2048 | 16.849 (1.0x) | 19.681 (0.9x) | 1.975 (8.5x) | **0.493 (34.2x)** |
+
+如何解读这张表：
+
+- **分块比逐 token 快 3.1x–21.3x**，且上下文越长差距越大。`seq_len=2048` 时逐 token 版本**比 PyTorch 还慢** —— 它的开销取决于 token 数量，而不是访存量。
+- **“Fast PyTorch”往往是最慢的。** 它的向量化 gather 会 materialize 一份稠密的 `(batch, max_ctx, kv_heads, head_dim)` cache 副本，batch 32 时这次分配就成了主要开销。而“填充成稠密张量”恰恰是 paged attention 要避免的事情。
+- **Triton kernel 在大 batch 下优势最明显**，此时 `(batch, num_heads)` 的 grid 才有足够多的 program 填满 GPU。
+- **batch 1 是短板**：只有 16 个 program，GPU 大部分处于空闲。把 KV 序列拆分到多个 program（flash-decoding）是下一步优化 —— grid 变成 `(batch, heads, kv_splits)`，再用第二个 kernel 合并各 split 的 `(m, l, acc)`。
+
+通用的逐 token gather 相比块对齐版本没有可测量的开销（kernel 是访存受限的），而且对任意 `block_size` 都成立：
+
+| block_size | Triton 逐 token | Triton 分块 | 加速比 |
+|-----------:|----------------:|------------:|-------:|
+| 16 | 0.978 ms | 0.056 ms | 17.5x |
+| 32 | 0.979 ms | 0.056 ms | 17.5x |
+| 100 | 1.014 ms | 0.057 ms | 17.8x |
+| 256 | 0.955 ms | 0.053 ms | 18.0x |
+
+（batch 4，seq_len 1000。`block_size=100` 是刻意选的：既不是 2 的幂，也不是 `BLOCK_N` 的整数倍。）
+
+运行方式：
+
+```bash
+uv run python benchmark_decoding.py                                  # 默认扫描
+uv run python benchmark_decoding.py --block-size 16 --seq-lens 1000  # 单个配置
+```
 
 ---
 

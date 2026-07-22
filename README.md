@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/minivllm.png" alt="图片描述" width="50%" height="50%">
+  <img src="./assets/minivllm.png" alt="MinivLLM" width="50%" height="50%">
 </p>
 
 <p align="center">
@@ -57,7 +57,7 @@ This showcases how the custom vLLM implementation handles batched text generatio
 uv run python benchmark_prefilling.py
 ```
 
-This is the pefilling phase comparison
+This is the prefilling phase comparison
 
 Compares three attention implementations during the **prefilling phase** (processing input prompts):
 
@@ -86,8 +86,8 @@ myvllm/
 │   └── myvllm/           # Core vLLM implementation
 │       ├── models/       # Model implementations
 │       ├── engine/       # LLM engine logic, including sequence definition for input prompts, block management for KV cache management for GPU, scheduler for iteration-based scheduling of sequences, runner for actual implementation of running prefilling and decoding, and engine for generation API interface
-│       ├── layers/       # Components for model/
-│       ├── utils/        # context
+│       ├── layers/       # Model layer components (activation, attention, embeddings, etc.)
+│       ├── utils/        # Utility helpers and inference context management
 │       └── sampling_parameters.py
 ├── main.py              # Full inference demo
 ├── benchmark_prefilling.py   # Prefilling attention comparison

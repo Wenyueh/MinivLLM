@@ -299,6 +299,12 @@ def paged_attention_decode_kernel(
     """
     Optimized paged attention kernel for decode phase.
     Processes KV cache in chunks.
+
+    The block table is gathered per token rather than per chunk, so a chunk may
+    straddle any number of blocks and no relation between BLOCK_N and block_size
+    is assumed. Each lane resolves its own token independently:
+
+        token t  ->  block_tables[batch, t // block_size], slot t % block_size
     """
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -331,77 +337,53 @@ def paged_attention_decode_kernel(
         if token_start < context_len:
             # Determine which tokens in this chunk are valid
             offs_n = token_start + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < context_len
-            
-          
+            logical_block = offs_n // block_size
+            # physical_block * block_size already moves the base pointer to the
+            # start of the block, so what is added is the offset *within* the
+            # block, not the global token index.
+            offs_in_block = offs_n % block_size
+
+            in_range = (offs_n < context_len) & (logical_block < max_num_blocks)
+
+            # One block-table entry per token: a chunk is free to span several
+            # blocks, and those blocks need not be adjacent in the cache.
+            physical_block = tl.load(
+                block_tables_ptr + batch_idx * max_num_blocks + logical_block,
+                mask=in_range, other=-1)
+            valid = in_range & (physical_block != -1)
+            # Masked-out lanes still take part in the address arithmetic, so give
+            # them block 0 to keep every computed offset inside the cache.
+            physical_block = tl.where(valid, physical_block, 0).to(tl.int64)
+
+            # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
+            kv_offset = (physical_block[None, :] * (block_size * num_kv_heads * head_dim)
+                         + offs_in_block[None, :] * (num_kv_heads * head_dim)
+                         + kv_head_idx * head_dim
+                         + offs_d[:, None])
+
             # Compute attention scores for this chunk
-            qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
-            
-            # Load K for each valid position and compute scores
-            for i in range(BLOCK_N):
-                token_idx = token_start + i
-                if token_idx < context_len:
-                    block_num = token_idx // block_size
-                    block_offset = token_idx % block_size
-                    
-                    if block_num < max_num_blocks:
-                        # Look up physical block
-                        block_table_offset = batch_idx * max_num_blocks + block_num
-                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
-                        
-                        if physical_block_idx != -1:
-                            # Load K
-                            k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                       block_offset * num_kv_heads * head_dim +
-                                       kv_head_idx * head_dim + offs_d)
-                            k_vec = tl.load(k_cache_ptr + k_offset)
-                            
-                            # Compute score for this token
-                            score = tl.sum(q * k_vec) * scale
-                            
-                            # Update qk array at position i using tl.where
-                            mask_i = tl.arange(0, BLOCK_N) == i
-                            qk = tl.where(mask_i, score, qk)
-            
-            # Apply mask to invalid positions
-            qk = tl.where(mask_n, qk, -1e10)
-            
+            k = tl.load(k_cache_ptr + kv_offset, mask=valid[None, :], other=0.0)
+            k = tl.cast(k, tl.float32)
+            score = tl.sum(q[:, None] * k, axis=0) * scale
+            qk = tl.where(valid, score, -1e10)
+
             # Online softmax
             m_ij = tl.max(qk)
             m_i_new = tl.maximum(m_i, m_ij)
             alpha = tl.exp(m_i - m_i_new)
             p = tl.exp(qk - m_i_new)
-            
+
             # Rescale accumulator
             acc = acc * alpha
             l_i = l_i * alpha
-            
-            # Load V and accumulate
-            for i in range(BLOCK_N):
-                token_idx = token_start + i
-                if token_idx < context_len:
-                    block_num = token_idx // block_size
-                    block_offset = token_idx % block_size
-                    
-                    if block_num < max_num_blocks:
-                        # Look up physical block
-                        block_table_offset = batch_idx * max_num_blocks + block_num
-                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
-                        
-                        if physical_block_idx != -1:
-                            # Load V
-                            v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
-                                       block_offset * num_kv_heads * head_dim +
-                                       kv_head_idx * head_dim + offs_d)
-                            v_vec = tl.load(v_cache_ptr + v_offset)
-                            
-                            # Extract weight for this token from p
-                            mask_i = tl.arange(0, BLOCK_N) == i
-                            weight = tl.sum(tl.where(mask_i, p, 0.0))
-                            
-                            acc = acc + weight * v_vec
-                            l_i = l_i + weight
-            
+
+            # Accumulate weighted values
+            v = tl.load(v_cache_ptr + kv_offset, mask=valid[None, :], other=0.0)
+            v = tl.cast(v, tl.float32)
+            weight = tl.where(valid, p, 0.0)
+            acc = acc + tl.sum(weight[None, :] * v, axis=1)
+            l_i = l_i + tl.sum(weight)
+
             m_i = m_i_new
     
     # Normalize

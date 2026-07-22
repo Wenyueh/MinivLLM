@@ -65,10 +65,11 @@ class LLMEngine:
     # return scheduled sequences and whether it is for prefilling
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
-    def step(self) -> tuple[list[int], bool]:
+    def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
         scheduled_sequences, is_prefill = self.scheduler.schedule()
+        num_processed_tokens = 0
         if not scheduled_sequences:
-            return [], is_prefill
+            return [], num_processed_tokens, is_prefill
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
         # Move outputs to CPU and convert them to a list

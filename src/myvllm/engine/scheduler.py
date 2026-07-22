@@ -19,12 +19,25 @@ class Scheduler:
         return len(self.waiting) == 0 and len(self.running) == 0
     
     def add_sequence(self, sequence: Sequence):
+        # Reject up front what the block manager could never satisfy, otherwise the
+        # sequence sits in `waiting` forever and only surfaces as a stalled engine.
+        capacity = len(self.block_manager.blocks)
+        if sequence.num_blocks > capacity:
+            raise ValueError(
+                f"Sequence {sequence.seq_id} needs {sequence.num_blocks} blocks "
+                f"({len(sequence)} tokens at block_size={self.block_manager.block_size}) "
+                f"but the KV cache only holds {capacity}. "
+                f"Raise max_cached_blocks or block_size, or shorten the prompt."
+            )
         self.waiting.append(sequence)
 
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_sequences = []
         current_scheduled_tokens = 0
+        # An empty schedule is only legitimate when this call freed blocks by
+        # preempting, so the next call can make progress. See the guard below.
+        preempted = False
         # try schedule for prefilling from waiting queue if not exceeding limits
         while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
             seq = self.waiting[0]
@@ -45,6 +58,7 @@ class Scheduler:
             seq = self.running.popleft()
             # use can_append to check whether we can append one more token
             if not self.block_manager.can_append(seq):
+                preempted = True
                 if self.running:
                     self.running.appendleft(seq)
                     self.preempt(self.running.pop())
@@ -63,6 +77,18 @@ class Scheduler:
         # re-add to running queue in the same order
         if scheduled_sequences:
             self.running.extendleft(reversed(scheduled_sequences))
+        elif not preempted and (self.waiting or self.running):
+            # Nothing was scheduled and nothing was preempted, so no engine state
+            # changed: every later schedule() would take the same decisions and
+            # LLMEngine.generate() would spin forever. Fail loudly instead.
+            raise RuntimeError(
+                "Scheduler made no progress: "
+                f"{len(self.waiting)} waiting and {len(self.running)} running sequences, "
+                f"{len(self.block_manager.free_block_ids)} of "
+                f"{len(self.block_manager.blocks)} blocks free. "
+                "This means either a sequence that cannot fit in the KV cache, or "
+                "blocks leaked because their ref_count never returned to 0."
+            )
 
         return scheduled_sequences, False
 

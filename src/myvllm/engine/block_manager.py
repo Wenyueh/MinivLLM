@@ -17,8 +17,12 @@ class Block:
         self.token_ids = token_ids
 
     def reset(self):
-        self.hash = -1 
-        self.ref_count = 0
+        self.hash = -1
+        # reset() is only reached via BlockManager._allocate_block, which takes the
+        # block off the free list on behalf of exactly one sequence. Allocation is
+        # therefore the first reference: leaving this at 0 makes the matching
+        # deallocate() drive ref_count to -1, so the block is never freed.
+        self.ref_count = 1
         self.token_ids = []
 
 class BlockManager:
@@ -56,6 +60,15 @@ class BlockManager:
     def _deallocate_block(self, block_id: int) -> None:
         assert self.blocks[block_id].ref_count == 0, "Block is still in use"
         block = self.blocks[block_id]
+        # Clearing token_ids deliberately keeps the prefix cache scoped to blocks that
+        # are still referenced: a freed block can no longer match in allocate(), so a
+        # cache hit never spans a finished sequence. Reuse across sequences is not
+        # enabled yet because the prefill path cannot consume it -- the Triton kernel
+        # in layers/attention.py attends only over the K/V computed in that pass and
+        # ignores context.block_tables, and qwen3 derives RoPE positions from
+        # cu_seqlens_q, so both would be wrong by num_cached_tokens. Enabling reuse
+        # means a paged prefill kernel (cu_seqlens_q != cu_seqlens_k) plus a position
+        # offset; until then this line is what keeps the engine correct.
         block.token_ids = []
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
@@ -84,6 +97,9 @@ class BlockManager:
                 seq.num_cached_tokens += self.block_size # which == len(token_ids)
                 # update block information, considering the edge case that the block is not allocated yet but with hash code
                 if block_id not in self.used_block_ids:
+                    # Unreachable while _deallocate_block clears token_ids: a freed
+                    # block has token_ids == [] and fails the match above. Kept for
+                    # when cross-sequence reuse is enabled.
                     block = self._allocate_block(block_id)
                 else:
                     # update block information
@@ -111,7 +127,12 @@ class BlockManager:
     # this is to check whether we can append tokens to this sequence
     # when that token would require allocating a new block.
     def can_append(self, seq: Sequence) -> bool:
-        if seq.num_tokens % self.block_size == 0:
+        # Called after the new token is already counted in seq.num_tokens, so the
+        # condition must match append()'s allocation branch: a fresh block is only
+        # needed when that token is the first of a new block (num_tokens % size == 1).
+        # At num_tokens % size == 0 the token still fits in the block the sequence
+        # already holds, and append() merely finalizes its hash.
+        if seq.num_tokens % self.block_size == 1:
             return len(self.free_block_ids) > 0
         return True
 
