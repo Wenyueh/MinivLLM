@@ -91,6 +91,7 @@ class Sequence:
             self.num_prompt_tokens, 
             self.num_cached_tokens, 
             self.block_table,
+            self.block_size,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token
         )
 
@@ -100,6 +101,7 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.block_table,
+            self.block_size,
             last_token_or_ids
         ) = state
         # Check if this is prefill (num_completion_tokens == 0) or decode phase
