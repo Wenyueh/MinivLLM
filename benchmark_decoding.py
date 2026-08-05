@@ -1,11 +1,12 @@
 """Paged-attention decode benchmark.
 
-Compares four implementations on identical inputs:
+Compares five implementations on identical inputs:
 
   Naive PyTorch   gathers K/V block by block in a Python loop, then dense attention
   Fast PyTorch    vectorised gather + batched matmul
   Triton (old)    one scalar iteration per token inside each chunk
   Triton (new)    whole chunk loaded as a single masked vector op
+  Triton (flash)  splits low-batch KV work across programs, then reduces
 
 Every implementation is checked against a float32 reference before it is timed, so
 a kernel that is fast because it reads the wrong memory shows up as NO in the
@@ -13,9 +14,14 @@ correct column rather than as a speedup.
 """
 
 import argparse
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
+
+
+BENCHMARK_DTYPE = torch.float16
 
 
 # =============================================================================
@@ -227,6 +233,136 @@ def paged_attention_decode_kernel_new(
     tl.store(output_ptr + output_offset, output)
 
 
+@triton.jit
+def paged_attention_decode_flash_partial_kernel(
+    partial_ptr,
+    query_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    block_tables_ptr,
+    context_lens_ptr,
+    scale: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_num_blocks: tl.constexpr,
+    max_num_splits: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CHUNKS_PER_SPLIT: tl.constexpr,
+):
+    """Compute one online-softmax partial state for a contiguous KV range."""
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    split_idx = tl.program_id(2)
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+    context_len = tl.load(context_lens_ptr + batch_idx)
+
+    offs_d = tl.arange(0, head_dim)
+    q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    q = tl.load(query_ptr + q_offset)
+
+    acc = tl.zeros([head_dim], dtype=tl.float32)
+    l_i = 0.0
+    m_i = -1e10
+    max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
+
+    for local_chunk_idx in range(CHUNKS_PER_SPLIT):
+        chunk_idx = split_idx * CHUNKS_PER_SPLIT + local_chunk_idx
+        token_start = chunk_idx * BLOCK_N
+        if chunk_idx < max_chunks and token_start < context_len:
+            offs_n = token_start + tl.arange(0, BLOCK_N)
+            logical_block = offs_n // block_size
+            offs_in_block = offs_n % block_size
+            in_range = (
+                (offs_n < context_len)
+                & (logical_block < max_num_blocks)
+            )
+            physical_block = tl.load(
+                block_tables_ptr
+                + batch_idx * max_num_blocks
+                + logical_block,
+                mask=in_range,
+                other=-1,
+            )
+            valid = in_range & (physical_block != -1)
+            physical_block = tl.where(valid, physical_block, 0).to(tl.int64)
+
+            kv_offset = (
+                physical_block[None, :]
+                * (block_size * num_kv_heads * head_dim)
+                + offs_in_block[None, :] * (num_kv_heads * head_dim)
+                + kv_head_idx * head_dim
+                + offs_d[:, None]
+            )
+            k = tl.load(
+                k_cache_ptr + kv_offset,
+                mask=valid[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            score = tl.sum(q[:, None] * k, axis=0) * scale
+            qk = tl.where(valid, score, -1e10)
+
+            m_ij = tl.max(qk)
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new)
+            acc *= alpha
+            l_i *= alpha
+
+            v = tl.load(
+                v_cache_ptr + kv_offset,
+                mask=valid[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            weight = tl.where(valid, p, 0.0)
+            acc += tl.sum(weight[None, :] * v, axis=1)
+            l_i += tl.sum(weight)
+            m_i = m_i_new
+
+    partial_base = (
+        (batch_idx * num_heads + head_idx) * max_num_splits + split_idx
+    ) * (head_dim + 2)
+    tl.store(partial_ptr + partial_base + offs_d, acc)
+    tl.store(partial_ptr + partial_base + head_dim, m_i)
+    tl.store(partial_ptr + partial_base + head_dim + 1, l_i)
+
+
+@triton.jit
+def paged_attention_decode_flash_reduce_kernel(
+    output_ptr,
+    partial_ptr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    max_num_splits: tl.constexpr,
+):
+    """Merge per-split online-softmax states into the final output."""
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    offs_d = tl.arange(0, head_dim)
+    acc = tl.zeros([head_dim], dtype=tl.float32)
+    l_i = 0.0
+    m_i = -1e10
+
+    for split_idx in range(max_num_splits):
+        partial_base = (
+            (batch_idx * num_heads + head_idx) * max_num_splits + split_idx
+        ) * (head_dim + 2)
+        split_l = tl.load(partial_ptr + partial_base + head_dim + 1)
+        if split_l > 0.0:
+            split_m = tl.load(partial_ptr + partial_base + head_dim)
+            split_acc = tl.load(partial_ptr + partial_base + offs_d)
+            m_i_new = tl.maximum(m_i, split_m)
+            alpha = tl.exp(m_i - m_i_new)
+            beta = tl.exp(split_m - m_i_new)
+            acc = acc * alpha + split_acc * beta
+            l_i = l_i * alpha + split_l * beta
+            m_i = m_i_new
+
+    output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    tl.store(output_ptr + output_offset, acc / l_i)
+
+
 def _make_triton_launcher(kernel):
     """Wrap a decode kernel behind a common signature."""
     def launch(
@@ -261,6 +397,102 @@ def _make_triton_launcher(kernel):
 
 paged_attention_decode_triton_old = _make_triton_launcher(paged_attention_decode_kernel_old)
 paged_attention_decode_triton_new = _make_triton_launcher(paged_attention_decode_kernel_new)
+
+
+@lru_cache(maxsize=None)
+def _get_sm_count(device_index: int) -> int:
+    """Cache the device SM count outside the decode hot path."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def paged_attention_decode_triton_flash(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Use split-KV for long batch-1 decode and the new kernel otherwise."""
+    batch_size = query.shape[0]
+    max_num_blocks = block_tables.shape[1]
+    block_n = 64 if head_dim <= 128 else 32
+
+    use_flash_decode = batch_size == 1 and max_num_blocks >= 8
+    if use_flash_decode:
+        max_chunks = triton.cdiv(max_num_blocks * block_size, block_n)
+        device_index = query.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        desired_splits = triton.cdiv(
+            _get_sm_count(device_index), batch_size * num_heads
+        )
+        chunks_per_split = triton.cdiv(max_chunks, desired_splits)
+        use_flash_decode = desired_splits > 1 and chunks_per_split >= 4
+
+    query = query.contiguous()
+    output = torch.empty_like(query)
+    if not use_flash_decode:
+        grid = (batch_size, num_heads)
+        paged_attention_decode_kernel_new[grid](
+            output,
+            query,
+            k_cache,
+            v_cache,
+            block_tables,
+            context_lens,
+            scale=scale,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            max_num_blocks=max_num_blocks,
+            BLOCK_N=block_n,
+        )
+        return output
+
+    max_num_splits = triton.cdiv(max_chunks, chunks_per_split)
+    partial = torch.empty(
+        batch_size,
+        num_heads,
+        max_num_splits,
+        head_dim + 2,
+        device=query.device,
+        dtype=torch.float32,
+    )
+    partial_grid = (batch_size, num_heads, max_num_splits)
+    paged_attention_decode_flash_partial_kernel[partial_grid](
+        partial,
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        context_lens,
+        scale=scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        max_num_blocks=max_num_blocks,
+        max_num_splits=max_num_splits,
+        BLOCK_N=block_n,
+        CHUNKS_PER_SPLIT=chunks_per_split,
+        num_warps=4,
+    )
+    reduce_grid = (batch_size, num_heads)
+    paged_attention_decode_flash_reduce_kernel[reduce_grid](
+        output,
+        partial,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        max_num_splits=max_num_splits,
+        num_warps=4,
+    )
+    return output
 
 
 # =============================================================================
@@ -391,6 +623,7 @@ IMPLS = {
     "Fast PyTorch": decode_torch_optimized,
     "Triton (old)": paged_attention_decode_triton_old,
     "Triton (new)": paged_attention_decode_triton_new,
+    "Triton (flash)": paged_attention_decode_triton_flash,
 }
 
 
@@ -401,15 +634,24 @@ IMPLS = {
 def setup_test_data(batch_size, seq_len, num_heads, num_kv_heads, head_dim, block_size, device='cuda'):
     """Setup test data for benchmarking"""
     # Query: (batch_size, num_heads, head_dim)
-    q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=torch.float16)
+    q = torch.randn(
+        batch_size, num_heads, head_dim,
+        device=device, dtype=BENCHMARK_DTYPE,
+    )
 
     # Calculate number of blocks needed
     max_num_blocks = (seq_len + block_size - 1) // block_size
     total_blocks = batch_size * max_num_blocks
 
     # KV Cache: (total_blocks, block_size, num_kv_heads, head_dim)
-    k_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
-    v_cache = torch.randn(total_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.float16)
+    k_cache = torch.randn(
+        total_blocks, block_size, num_kv_heads, head_dim,
+        device=device, dtype=BENCHMARK_DTYPE,
+    )
+    v_cache = torch.randn(
+        total_blocks, block_size, num_kv_heads, head_dim,
+        device=device, dtype=BENCHMARK_DTYPE,
+    )
 
     # Block tables: (batch_size, max_num_blocks).
     # Shuffled, not arange: a real BlockManager hands out whatever blocks are free,
@@ -527,6 +769,7 @@ def main():
 
     print("\n" + "=" * 74)
     print("PAGED ATTENTION DECODE BENCHMARK")
+    print(f"dtype: {str(BENCHMARK_DTYPE).removeprefix('torch.')}")
     print("Comparing: " + " | ".join(IMPLS))
     print("=" * 74)
 
