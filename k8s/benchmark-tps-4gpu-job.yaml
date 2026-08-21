@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minivllm-tps-benchmark-4gpu
+  namespace: ns008
+  labels:
+    app.kubernetes.io/name: minivllm
+    app.kubernetes.io/component: tps-benchmark
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minivllm
+        app.kubernetes.io/component: tps-benchmark
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      tolerations:
+        - key: policy.prajna.tencent.com/pool
+          operator: Exists
+          effect: NoSchedule
+        - key: skypilot.co/accelerator
+          operator: Equal
+          value: h200
+          effect: NoSchedule
+      containers:
+        - name: benchmark
+          image: 028236335745.dkr.ecr.us-east-2.amazonaws.com/galileo/minivllm:v6
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              status=0
+              for backend in minivllm vllm transformers; do
+                echo "===== backend=${backend} ====="
+                uv run python benchmark_tps.py --world-size 4 --backend "${backend}" || status=$?
+              done
+              exit "${status}"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: CUDA_DEVICE_ORDER
+              value: PCI_BUS_ID
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+            - name: VLLM_WORKER_MULTIPROC_METHOD
+              value: spawn
+          resources:
+            requests:
+              nvidia.com/gpu: "4"
+            limits:
+              nvidia.com/gpu: "4"
+          volumeMounts:
+            - name: shmem
+              mountPath: /dev/shm
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+      volumes:
+        - name: shmem
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: hf-cache
+          emptyDir: {}

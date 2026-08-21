@@ -1,8 +1,6 @@
+import argparse
 import time
-import os
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer,AutoModelForCausalLM
 
@@ -39,7 +37,7 @@ config = {
     'max_position': 32768, # should be >= max_model_length, max position index allowed in rotary embedding
     'ffn_bias': False,  # Fixed: HF Qwen3 doesn't use MLP bias
     'max_num_batch_tokens': 4096,
-    'max_model_length': 128,
+    'max_model_length': 512,
     'gpu_memory_utilization': 0.9,
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
 }
@@ -60,12 +58,14 @@ def cuda_sync():
         torch.cuda.synchronize()
 
 
-def run_minivllm(tokenizer):
-    llm = MiniLLM(config=config)  
+def run_minivllm(tokenizer, world_size):
+    mini_config = dict(config)
+    mini_config["world_size"] = world_size
+    llm = MiniLLM(config=mini_config)
     sampling = MiniSamplingParams(
         temperature=0.6,
         max_tokens=OUTPUT_TOKENS,
-        max_model_length=128,
+        max_model_length=mini_config["max_model_length"],
     )
 
     prompts = [
@@ -97,14 +97,15 @@ def run_minivllm(tokenizer):
     }
 
 
-def run_vllm(tokenizer):
+def run_vllm(tokenizer, world_size):
     # vLLM
     llm = VLLM(
         model=MODEL_NAME,
         tokenizer=MODEL_NAME,
         trust_remote_code=False, 
         gpu_memory_utilization=0.75,  
-        max_model_len=256, 
+        max_model_len=config["max_model_length"],
+        tensor_parallel_size=world_size,
         speculative_config=None, 
     )
 
@@ -153,14 +154,16 @@ def run_transformers_test(tokenizer):
     # warmup
     for _ in range(WARMUP_STEPS):
         with torch.no_grad():
-            model.generate(inputs['input_ids'], attention_mask=attention_mask, max_length=OUTPUT_TOKENS)
+            model.generate(inputs['input_ids'], attention_mask=attention_mask, max_new_tokens=OUTPUT_TOKENS)
 
+    cuda_sync()
     start = time.perf_counter()
     with torch.no_grad():
-        outputs = model.generate(inputs['input_ids'], attention_mask=attention_mask, max_length=OUTPUT_TOKENS)
+        outputs = model.generate(inputs['input_ids'], attention_mask=attention_mask, max_new_tokens=OUTPUT_TOKENS)
+    cuda_sync()
     end = time.perf_counter()
 
-    total_tokens = sum(len(output) for output in outputs)
+    total_tokens = outputs.shape[0] * (outputs.shape[1] - inputs["input_ids"].shape[1])
     latency = end - start
 
     tps = total_tokens / latency
@@ -173,25 +176,38 @@ def run_transformers_test(tokenizer):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="End-to-end generation throughput benchmark")
+    parser.add_argument("--world-size", type=int, default=1)
+    parser.add_argument(
+        "--backend",
+        choices=["minivllm", "vllm", "transformers"],
+        default="minivllm",
+    )
+    args = parser.parse_args()
+
+    if args.world_size < 1:
+        parser.error("--world-size must be at least 1")
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, padding_side='left')
 
-    print("Running minivllm benchmark...")
-    mini = run_minivllm(tokenizer)
+    print(f"Running {args.backend} benchmark (requested world_size={args.world_size})...")
+    if args.backend == "minivllm":
+        result = run_minivllm(tokenizer, args.world_size)
+        effective_gpus = args.world_size
+    elif args.backend == "vllm":
+        result = run_vllm(tokenizer, args.world_size)
+        effective_gpus = args.world_size
+    else:
+        # This plain Transformers baseline is intentionally single-GPU; it does
+        # not implement tensor parallelism in this script.
+        result = run_transformers_test(tokenizer)
+        effective_gpus = 1
 
-    print("Running vLLM benchmark...")
-    vllm = run_vllm(tokenizer)
-
-    print("Running transformers benchmark...")
-    transformers = run_transformers_test(tokenizer)
-
-
-    results = {
-        "minivllm": mini,
-        "vLLM": vllm,
-        "transformers":transformers
-    }
+    results = {args.backend: result}
 
     print("\n=== Benchmark Results ===")
+    print(f"requested_world_size: {args.world_size}")
+    print(f"effective_gpus: {effective_gpus}")
     for k, v in results.items():
         print(f"{k}:")
         for kk, vv in v.items():

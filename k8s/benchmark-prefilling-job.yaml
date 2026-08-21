@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minivllm-prefilling-benchmark
+  namespace: ns008
+  labels:
+    app.kubernetes.io/name: minivllm
+    app.kubernetes.io/component: prefilling-benchmark
+spec:
+  # A failed benchmark should stay failed instead of being retried on another node.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minivllm
+        app.kubernetes.io/component: prefilling-benchmark
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+
+      # GPU pools in this cluster use different labels but share these taint keys.
+      # The nvidia.com/gpu request below is what restricts this Pod to GPU nodes.
+      tolerations:
+        - key: policy.prajna.tencent.com/pool
+          operator: Exists
+          effect: NoSchedule
+        - key: skypilot.co/accelerator
+          operator: Equal
+          value: h200
+          effect: NoSchedule
+
+      containers:
+        - name: benchmark
+          image: 028236335745.dkr.ecr.us-east-2.amazonaws.com/galileo/minivllm:v3
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command: ["uv", "run", "python", "benchmark_prefilling.py"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: CUDA_DEVICE_ORDER
+              value: PCI_BUS_ID
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"

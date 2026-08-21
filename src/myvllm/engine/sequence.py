@@ -87,6 +87,7 @@ class Sequence:
 
     def __getstate__(self):
         return (
+            self.block_size,
             self.num_tokens, 
             self.num_prompt_tokens, 
             self.num_cached_tokens, 
@@ -96,6 +97,7 @@ class Sequence:
 
     def __setstate__(self, state):
         (
+            self.block_size,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,

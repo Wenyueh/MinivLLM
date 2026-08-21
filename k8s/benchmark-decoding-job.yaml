@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minivllm-decoding-benchmark
+  namespace: ns008
+  labels:
+    app.kubernetes.io/name: minivllm
+    app.kubernetes.io/component: decoding-benchmark
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minivllm
+        app.kubernetes.io/component: decoding-benchmark
+    spec:
+      restartPolicy: Never
+      tolerations:
+        - key: policy.prajna.tencent.com/pool
+          operator: Exists
+          effect: NoSchedule
+        - key: skypilot.co/accelerator
+          operator: Equal
+          value: h200
+          effect: NoSchedule
+      containers:
+        - name: benchmark
+          image: 028236335745.dkr.ecr.us-east-2.amazonaws.com/galileo/minivllm:v5
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command: ["uv", "run", "python", "benchmark_decoding.py"]
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: CUDA_DEVICE_ORDER
+              value: PCI_BUS_ID
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"

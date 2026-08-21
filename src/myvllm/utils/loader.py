@@ -85,13 +85,16 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
                         k_weight = hf_weights[k_name]
                         v_weight = hf_weights[v_name]
 
-                        # Concatenate q, k, v along output dimension
-                        qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-
                         custom_name = f"model.layers.{layer_idx}.self_attn.qkv_projection.weight"
                         try:
                             param = model.get_parameter(custom_name)
-                            param.data.copy_(qkv_weight)
+                            if hasattr(param, "weight_loader"):
+                                param.weight_loader(param, q_weight, "q")
+                                param.weight_loader(param, k_weight, "k")
+                                param.weight_loader(param, v_weight, "v")
+                            else:
+                                qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+                                param.data.copy_(qkv_weight)
                             loaded_params.add(custom_name)
                             loaded_params.add(hf_name)
                             loaded_params.add(k_name)
@@ -111,12 +114,15 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
                         up_weight = hf_weights[up_name]
 
                         # Concatenate gate and up along output dimension
-                        gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
-
                         custom_name = f"model.layers.{layer_idx}.mlp.gate_up.weight"
                         try:
                             param = model.get_parameter(custom_name)
-                            param.data.copy_(gate_up_weight)
+                            if hasattr(param, "weight_loader"):
+                                param.weight_loader(param, gate_weight, 0)
+                                param.weight_loader(param, up_weight, 1)
+                            else:
+                                gate_up_weight = torch.cat([gate_weight, up_weight], dim=0)
+                                param.data.copy_(gate_up_weight)
                             loaded_params.add(custom_name)
                             loaded_params.add(hf_name)
                             loaded_params.add(up_name)
@@ -154,7 +160,9 @@ def load_weights_from_checkpoint(model: nn.Module, model_name_or_path: str):
             else:
                 try:
                     param = model.get_parameter(hf_name)
-                    if param.shape != hf_weight.shape:
+                    if hasattr(param, "weight_loader"):
+                        param.weight_loader(param, hf_weight)
+                    elif param.shape != hf_weight.shape:
                         # Handle vocab size mismatch for embeddings/lm_head
                         if len(param.shape) > 0 and len(hf_weight.shape) > 0:
                             min_size = min(param.shape[0], hf_weight.shape[0])
