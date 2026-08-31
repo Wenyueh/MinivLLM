@@ -67,7 +67,8 @@ class BlockManager:
         # ignores context.block_tables, and qwen3 derives RoPE positions from
         # cu_seqlens_q, so both would be wrong by num_cached_tokens. Enabling reuse
         # means a paged prefill kernel (cu_seqlens_q != cu_seqlens_k) plus a position
-        # offset; until then this line is what keeps the engine correct.
+        # offset; until then this line, together with allocate() refusing to share
+        # live blocks, is what keeps the engine correct.
         block.token_ids = []
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
@@ -87,23 +88,22 @@ class BlockManager:
             h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)
             
-            # if cache miss or hash collision
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            # A hash hit is only safe on a block no live sequence is using.
+            # Sharing a live block advances num_cached_tokens, but the prefill
+            # path cannot consume cached K/V yet (see the note in
+            # _deallocate_block), so the sequence would silently attend only
+            # over its own new tokens with RoPE positions restarting at 0.
+            if (
+                block_id == -1
+                or block_id in self.used_block_ids
+                or self.blocks[block_id].token_ids != token_ids
+            ):
                 no_cache_found = True
 
             if not no_cache_found:
                 # update sequence information
                 seq.num_cached_tokens += self.block_size # which == len(token_ids)
-                # update block information, considering the edge case that the block is not allocated yet but with hash code
-                if block_id not in self.used_block_ids:
-                    # Unreachable while _deallocate_block clears token_ids: a freed
-                    # block has token_ids == [] and fails the match above. Kept for
-                    # when cross-sequence reuse is enabled.
-                    block = self._allocate_block(block_id)
-                else:
-                    # update block information
-                    block = self.blocks[self.hash_to_block_id[h]]
-                    block.ref_count += 1
+                block = self._allocate_block(block_id)
             else:
                 # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
