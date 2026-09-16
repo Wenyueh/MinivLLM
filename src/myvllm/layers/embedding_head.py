@@ -56,7 +56,7 @@ class VocabParallelEmbedding(nn.Module):
 
         if dist.get_world_size() > 1:
             # need to mask again, otherwise the embedding for the out-of-range ids will be the embedding of id 0
-            output = mask.unsqueeze(1) * output
+            output = mask.unsqueeze(-1) * output
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
         return output
 
