@@ -46,9 +46,9 @@ class TestBug2TokenLimitBreak:
     """
 
     def _run(self, scheduler: Scheduler):
-        seq_a = Sequence([1, 2, 3])
-        seq_b = Sequence([4, 5, 6])
-        seq_c = Sequence([7, 8, 9])
+        seq_a = Sequence([1, 2, 3], block_size=4)
+        seq_b = Sequence([4, 5, 6], block_size=4)
+        seq_c = Sequence([7, 8, 9], block_size=4)
         inject_running(scheduler, seq_a, seq_b, seq_c)
 
         scheduler.block_manager = MagicMock()
@@ -108,8 +108,8 @@ class TestBug1CanAppendFailure:
     """
 
     def _run(self, scheduler: Scheduler):
-        seq_a = Sequence([1, 2, 3])
-        seq_b = Sequence([4, 5, 6])
+        seq_a = Sequence([1, 2, 3], block_size=4)
+        seq_b = Sequence([4, 5, 6], block_size=4)
         inject_running(scheduler, seq_a, seq_b)
 
         mock_bm = MagicMock()
@@ -146,7 +146,7 @@ class TestBug1CanAppendFailure:
 class TestSchedulerHappyPath:
     def test_prefill_scheduled_first(self):
         scheduler = make_scheduler(max_num_batched_tokens=100, max_cached_blocks=50)
-        seq = Sequence([1, 2, 3, 4])
+        seq = Sequence([1, 2, 3, 4], block_size=4)
         scheduler.add_sequence(seq)
 
         scheduled, is_prefill = scheduler.schedule()
@@ -156,8 +156,8 @@ class TestSchedulerHappyPath:
 
     def test_all_running_seqs_scheduled_when_budget_allows(self):
         scheduler = make_scheduler(max_num_batched_tokens=10)
-        seq_a = Sequence([1])
-        seq_b = Sequence([2])
+        seq_a = Sequence([1], block_size=4)
+        seq_b = Sequence([2], block_size=4)
         inject_running(scheduler, seq_a, seq_b)
 
         scheduler.block_manager = MagicMock()
@@ -174,7 +174,7 @@ class TestSchedulerHappyPath:
     def test_preempt_only_seq_when_cant_append_and_running_empty(self):
         """Original else-branch: running=[seq], can_append=False → preempt seq → waiting."""
         scheduler = make_scheduler()
-        seq = Sequence([1, 2])
+        seq = Sequence([1, 2], block_size=4)
         inject_running(scheduler, seq)
 
         scheduler.block_manager = MagicMock()
