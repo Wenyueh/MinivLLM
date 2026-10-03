@@ -86,29 +86,18 @@ class Sequence:
         self.num_tokens += 1 
 
     def __getstate__(self):
-        return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
-            self.num_cached_tokens, 
-            self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
-        )
+        # Preserve every attribute instead of a hand-maintained tuple. The tuple
+        # silently desynchronized when a field was added, which is exactly what
+        # #89 is: the worker unpickled a Sequence without block_size and raised
+        # AttributeError from num_blocks / num_cached_blocks /
+        # last_block_num_tokens. Routing the whole __dict__ means a new field
+        # cannot fall out of the protocol again.
+        state = self.__dict__.copy()
+        # Decode only needs the newest token on the worker; shipping the whole
+        # token list every step would make the shared-memory hop O(seq length).
+        if self.num_completion_tokens > 0:
+            state["token_ids"] = [self.last_token]
+        return state
 
     def __setstate__(self, state):
-        (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.num_cached_tokens,
-            self.block_table,
-            last_token_or_ids
-        ) = state
-        # Check if this is prefill (num_completion_tokens == 0) or decode phase
-        num_completion_tokens = self.num_tokens - self.num_prompt_tokens
-        if num_completion_tokens == 0:
-            # Prefill: last_token_or_ids is the full token_ids list
-            self.token_ids = last_token_or_ids
-        else:
-            # Decode: last_token_or_ids is just the last token
-            self.token_ids = [last_token_or_ids]
-        # Restore last_token attribute
-        self.last_token = self.token_ids[-1] if self.token_ids else None
+        self.__dict__.update(state)
