@@ -361,12 +361,19 @@ class ModelRunner:
             bs = input_ids.size(0)
             context = get_context()
 
-            # finds smallest captured graph that fits the batch size
-            graph = self.graphs[next(bs_ for bs_ in self.graphs.keys() if bs_ >= bs)]
+            # Pick the smallest captured graph that fits the batch size.
+            # self.graphs is populated in descending order (16, 8, 4, 2, 1), so iterating
+            # dict keys directly would make e.g. bs=3 match the bs=16 graph and compute
+            # 13 rows of garbage; sort first so padding is minimal.
+            padded_bs = next(bs_ for bs_ in sorted(self.graphs) if bs_ >= bs)
+            graph = self.graphs[padded_bs]
             vars = self.graph_vars
             # copy input data into graph variables
             vars['input_ids'][:bs].copy_(input_ids)
-            vars['slot_mapping'][:bs].fill_(-1)
+            # Rows [bs, padded_bs) are padding. Their slot must be -1 because
+            # store_kvcache_kernel returns early on -1; otherwise the stale slots left
+            # over from a previous replay would write garbage KV into recycled blocks.
+            vars['slot_mapping'][:padded_bs].fill_(-1)
             vars['slot_mapping'][:bs].copy_(context.slot_mapping)
             vars["context_lens"].zero_()
             vars['context_lens'][:bs].copy_(context.context_lens)
@@ -404,7 +411,10 @@ class ModelRunner:
     # (later use graph.replay() to run the captured graph)
     @torch.inference_mode()
     def capture_cudagraph(self) -> None:
-        max_bs = self.config['max_num_seqs']
+        # max_num_seqs bounds the graph batch size. Fall back to max_num_sequences so
+        # that enabling enforce_eager=False does not raise KeyError when the caller's
+        # config (e.g. main.py) only defines max_num_sequences.
+        max_bs = self.config.get('max_num_seqs', self.config['max_num_sequences'])
         max_len = self.config['max_model_length']
         max_num_blocks = math.ceil(max_len / self.block_size)
         # for decoding, input is always of shape (batch_size, 1)
@@ -416,8 +426,9 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
         # where to read KV values in the cache
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=f'cuda:{self.rank}')
-        # output logits
-        outputs = torch.zeros(max_bs, self.config['vocab_size'], device=f'cuda:{self.rank}')
+        # output hidden states: self.model() returns the last hidden state
+        # (max_bs, hidden_size), NOT logits; compute_logits() is called outside the graph.
+        outputs = torch.zeros(max_bs, self.config['hidden_size'], device=f'cuda:{self.rank}')
 
         # graphs to be captured for different batch sizes
         batch_sizes = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -436,12 +447,20 @@ class ModelRunner:
                 context_lens=context_lens[:batch_size],
                 block_tables=block_tables[:batch_size],
             )
+            # warmup: run once eagerly so all kernels and memory pools are initialized
+            # before capture (a lazy init inside the capture region is illegal).
             outputs[:batch_size] = self.model(input_ids[:batch_size])
+            torch.cuda.synchronize()
 
             with torch.cuda.graph(graph, graph_pool):
                 outputs[:batch_size] = self.model(input_ids[:batch_size])
-                if graph_pool is None:
-                    graph_pool = graph.pool()
+
+            # graph.pool() is only valid AFTER a successful capture, i.e. once the
+            # `with` block has exited. Calling it inside the block raises
+            # "CUDAGraph::pool() without a preceding successful capture".
+            if graph_pool is None:
+                graph_pool = graph.pool()
+
             # store the captured graph
             self.graphs[batch_size] = graph
 
