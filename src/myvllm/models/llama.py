@@ -50,9 +50,9 @@ class LlamaAttn(nn.Module):
             is_llama3=True
         )
         self.attention = Attention(
-            num_heads=num_qo_heads,
+            num_heads=self.num_heads,
             head_dim=head_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=self.num_kv_heads,
             block_size=block_size,
         )
         self.o_proj = RowParallelLinear(
