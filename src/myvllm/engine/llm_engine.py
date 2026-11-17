@@ -93,8 +93,15 @@ class LLMEngine:
     # call step until all sequences are finished
     # return the generated texts
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:
-        for prompt in prompts:
-            self.add_prompt(prompt, sampling_params)
+        num_waiting = len(self.scheduler.waiting)
+        try:
+            for prompt in prompts:
+                self.add_prompt(prompt, sampling_params)
+        except Exception:
+            # Admission only appends to waiting; no cache blocks are allocated yet.
+            while len(self.scheduler.waiting) > num_waiting:
+                self.scheduler.waiting.pop()
+            raise
         generated_tokens = {}
         while not self.scheduler.is_finished():
             start_t = time.time()
