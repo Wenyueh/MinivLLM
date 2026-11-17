@@ -19,6 +19,11 @@ class Scheduler:
         return len(self.waiting) == 0 and len(self.running) == 0
     
     def add_sequence(self, sequence: Sequence):
+        if sequence.block_size != self.block_manager.block_size:
+            raise ValueError(
+                f"Sequence block_size ({sequence.block_size}) must match "
+                f"the KV cache block_size ({self.block_manager.block_size})."
+            )
         # Reject up front what the block manager could never satisfy, otherwise the
         # sequence sits in `waiting` forever and only surfaces as a stalled engine.
         capacity = len(self.block_manager.blocks)
