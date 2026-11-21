@@ -4,7 +4,7 @@ import torch.nn as nn
 
 # Qwen3Attention: 
 # qkv projection
-# if not qkv_bias: then rms_norm
+# normalize query and key per head
 # apply rotary embedding to q, k
 # attention
 # output projection
@@ -106,9 +106,8 @@ class Qwen3Attention(nn.Module):
         # Apply Q and K norms - these are used in Qwen3 to stabilize attention
         # Applied to q and k because they participate in attention_weight computation
         # Removes possibility of large numbers that cause softmax instability
-        if self.qkv_bias is False:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         q, k = self.rotary_emb(positions, q, k)
 
